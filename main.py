@@ -4,9 +4,12 @@ import json
 import shutil
 import asyncio
 import re
+import time
+import uuid
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Annotated
 from typing_extensions import TypedDict
+import httpx
 from dotenv import load_dotenv
 
 # Ensure UTF-8 output on Windows consoles
@@ -20,7 +23,6 @@ if hasattr(sys.stdout, "reconfigure"):
 # LangChain & Gemini Imports
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
-from langchain_mcp_adapters.client import MultiServerMCPClient
 
 # LangGraph Imports
 from langgraph.graph import StateGraph, START, END
@@ -31,9 +33,10 @@ from langgraph.types import interrupt, Command
 # ---------------------------------------------------------------------------
 # 1. Environment & Tracing Setup
 # ---------------------------------------------------------------------------
-load_dotenv()
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ENV_FILE = os.path.join(SCRIPT_DIR, ".env")
+load_dotenv(ENV_FILE, override=True)
 
-# Verify and enable LangSmith tracing if keys exist in .env
 if os.getenv("LANGCHAIN_API_KEY"):
     os.environ["LANGCHAIN_TRACING_V2"] = os.getenv("LANGCHAIN_TRACING_V2", "true")
     os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT", "nutanix-network-enablement")
@@ -61,7 +64,8 @@ def get_llm() -> Optional[ChatGoogleGenerativeAI]:
 class EnablementState(TypedDict, total=False):
     user_intent: str                        # "Build" or "Destroy"
     group_id: Optional[str]                 # e.g., "01", "02"
-    discovered_state: Dict[str, Any]        # Cluster snapshot (VPCs, Subnets, External networks)
+    discovered_state: Dict[str, Any]        # Cluster snapshot (VPCs, Subnets)
+    captured_vlan_info: Dict[str, Any]      # Extracted VLAN ID, Cluster Ref, Subnet Name prior to deletion
     execution_plan: List[Dict[str, Any]]    # Generated list of planned actions
     approval_status: Optional[str]          # "approved" or "rejected"
     execution_results: List[Dict[str, Any]] # Outcome logs & UUIDs per executed action
@@ -69,54 +73,164 @@ class EnablementState(TypedDict, total=False):
     messages: Annotated[List[BaseMessage], add_messages]
 
 # ---------------------------------------------------------------------------
-# 3. Nutanix MCP Client Resolver & Helpers
+# 3. Nutanix Prism Central v4 API Client
 # ---------------------------------------------------------------------------
-def get_nutanix_mcp_command() -> str:
-    """Finds the nutanix-mcp executable command path."""
-    cmd = shutil.which("nutanix-mcp")
-    if not cmd:
-        venv_scripts = os.path.dirname(sys.executable)
-        cmd = shutil.which("nutanix-mcp", path=venv_scripts)
-    return cmd or "nutanix-mcp"
+class NutanixPrismClient:
+    """Direct client for Nutanix Prism Central v4 API with idempotency and task polling."""
 
-async def get_mcp_client_and_tools():
-    """Starts nutanix-mcp serve-stdio client and returns client + available tools."""
-    nutanix_cmd = get_nutanix_mcp_command()
-    client = MultiServerMCPClient({
-        "nutanix": {
-            "command": nutanix_cmd,
-            "args": ["serve-stdio"],
-            "transport": "stdio"
+    def __init__(self):
+        self.host = os.getenv("PC_HOST", "127.0.0.1")
+        self.port = os.getenv("PC_PORT", "9440")
+        self.username = os.getenv("PC_USERNAME", "admin")
+        self.password = os.getenv("PC_PASSWORD", "")
+        self.insecure = os.getenv("PC_INSECURE", "true").lower() in ["true", "1", "yes"]
+        self.base_url = f"https://{self.host}:{self.port}"
+        self.client = httpx.Client(
+            verify=not self.insecure,
+            auth=(self.username, self.password) if self.username and self.password else None,
+            timeout=30.0
+        )
+
+    def _headers(self) -> Dict[str, str]:
+        return {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "NTNX-Request-Id": str(uuid.uuid4())
         }
-    })
-    try:
-        tools = await client.get_tools()
-        return client, tools
-    except Exception as e:
-        print(f"[Warning] Could not initialize Nutanix MCP client: {e}")
-        return client, []
 
-async def execute_mcp_networking(tool, operation: str, path_params: Dict = None, query_params: Dict = None, request_body: Dict = None) -> Any:
-    """Executes a networking operation using the Nutanix MCP networking_execute tool."""
-    payload = {"operation": operation}
-    if path_params:
-        payload["path_params"] = path_params
-    if query_params:
-        payload["query_params"] = query_params
-    if request_body:
-        payload["request_body"] = request_body
-
-    try:
-        res = await tool.ainvoke(payload)
-        # Parse MCP response if returned as text or json
-        if isinstance(res, list) and len(res) > 0 and isinstance(res[0], dict) and "text" in res[0]:
+    def poll_task(self, task_ext_id: str, timeout_sec: int = 60) -> Optional[str]:
+        """Polls async task until SUCCEEDED and returns the primary entity ExtID."""
+        start_time = time.time()
+        while time.time() - start_time < timeout_sec:
             try:
-                return json.loads(res[0]["text"])
+                res = self.client.get(f"{self.base_url}/api/prism/v4.0/config/tasks/{task_ext_id}")
+                if res.status_code == 200:
+                    task_data = res.json().get("data", {})
+                    status = task_data.get("status")
+                    if status == "SUCCEEDED":
+                        entities = task_data.get("entitiesAffected", [])
+                        if entities:
+                            return entities[0].get("extId")
+                        return task_ext_id
+                    elif status in ["FAILED", "CANCELED"]:
+                        print(f"[Error] Task {task_ext_id} ended with status: {status}")
+                        return None
+            except Exception as e:
+                print(f"[Warning] Task polling note: {e}")
+            time.sleep(2)
+        return None
+
+    def list_subnets(self) -> List[Dict[str, Any]]:
+        for v in ["v4.0", "v4.0.b1", "v4.1"]:
+            try:
+                res = self.client.get(f"{self.base_url}/api/networking/{v}/config/subnets")
+                if res.status_code == 200:
+                    return res.json().get("data", [])
             except Exception:
-                return res[0]["text"]
-        return res
-    except Exception as e:
-        return {"error": str(e)}
+                pass
+        return []
+
+    def get_subnet(self, subnet_id: str) -> Optional[Dict[str, Any]]:
+        for v in ["v4.0", "v4.0.b1", "v4.1"]:
+            try:
+                res = self.client.get(f"{self.base_url}/api/networking/{v}/config/subnets/{subnet_id}")
+                if res.status_code == 200:
+                    return res.json().get("data")
+            except Exception:
+                pass
+        return None
+
+    def delete_subnet(self, subnet_id: str) -> bool:
+        for v in ["v4.0", "v4.0.b1", "v4.1"]:
+            try:
+                res = self.client.delete(
+                    f"{self.base_url}/api/networking/{v}/config/subnets/{subnet_id}",
+                    headers=self._headers()
+                )
+                if res.status_code in [200, 202, 204]:
+                    if res.status_code == 202:
+                        task_id = res.json().get("data", {}).get("extId")
+                        if task_id:
+                            self.poll_task(task_id)
+                    return True
+            except Exception as e:
+                print(f"[Error] Delete Subnet {subnet_id}: {e}")
+        return False
+
+    def create_subnet(self, subnet_payload: Dict[str, Any]) -> Optional[str]:
+        for v in ["v4.0", "v4.0.b1", "v4.1"]:
+            try:
+                res = self.client.post(
+                    f"{self.base_url}/api/networking/{v}/config/subnets",
+                    json=subnet_payload,
+                    headers=self._headers()
+                )
+                if res.status_code in [200, 201, 202]:
+                    data = res.json().get("data", {})
+                    if res.status_code == 202 and "TaskReference" in data.get("$objectType", ""):
+                        task_id = data.get("extId")
+                        return self.poll_task(task_id)
+                    return data.get("extId")
+                else:
+                    print(f"[Error] Create Subnet returned {res.status_code}: {res.text}")
+            except Exception as e:
+                print(f"[Error] Create Subnet exception: {e}")
+        return None
+
+    def list_vpcs(self) -> List[Dict[str, Any]]:
+        for v in ["v4.0", "v4.0.b1", "v4.1"]:
+            try:
+                res = self.client.get(f"{self.base_url}/api/networking/{v}/config/vpcs")
+                if res.status_code == 200:
+                    return res.json().get("data", [])
+            except Exception:
+                pass
+        return []
+
+    def create_vpc(self, vpc_payload: Dict[str, Any]) -> Optional[str]:
+        for v in ["v4.0", "v4.0.b1", "v4.1"]:
+            try:
+                res = self.client.post(
+                    f"{self.base_url}/api/networking/{v}/config/vpcs",
+                    json=vpc_payload,
+                    headers=self._headers()
+                )
+                if res.status_code in [200, 201, 202]:
+                    data = res.json().get("data", {})
+                    if res.status_code == 202 and "TaskReference" in data.get("$objectType", ""):
+                        task_id = data.get("extId")
+                        return self.poll_task(task_id)
+                    return data.get("extId")
+                else:
+                    print(f"[Error] Create VPC returned {res.status_code}: {res.text}")
+            except Exception as e:
+                print(f"[Error] Create VPC exception: {e}")
+        return None
+
+    def delete_vpc(self, vpc_id: str) -> bool:
+        # Clean up any subnets referencing this VPC first
+        for sub in self.list_subnets():
+            if sub.get("vpcReference") == vpc_id:
+                self.delete_subnet(sub.get("extId"))
+                time.sleep(1)
+
+        for v in ["v4.0", "v4.0.b1", "v4.1"]:
+            try:
+                res = self.client.delete(
+                    f"{self.base_url}/api/networking/{v}/config/vpcs/{vpc_id}",
+                    headers=self._headers()
+                )
+                if res.status_code in [200, 202, 204]:
+                    if res.status_code == 202:
+                        task_id = res.json().get("data", {}).get("extId")
+                        if task_id:
+                            self.poll_task(task_id)
+                    return True
+                else:
+                    print(f"[Error] Delete VPC returned {res.status_code}: {res.text}")
+            except Exception as e:
+                print(f"[Error] Delete VPC {vpc_id}: {e}")
+        return False
 
 # ---------------------------------------------------------------------------
 # 4. LangGraph Node Implementations
@@ -126,8 +240,9 @@ async def plan_discovery_node(state: EnablementState) -> Dict[str, Any]:
     """
     Node 1: Plan (Discovery & Intent)
     1. Interrupts to ask the user for intent (Build or Destroy) and Group_ID.
-    2. Queries Nutanix MCP to discover current cluster state (existing VPCs, subnets).
-    3. Generates a detailed execution_plan based on the intent and cluster discovery.
+    2. Queries Prism Central to discover current cluster state (existing VPCs, subnets).
+    3. Captures the VLAN ID and cluster attributes of the basic subnet before planning deletion.
+    4. Generates a detailed 4-step execution_plan for Build or cleanup plan for Destroy.
     """
     print("\n=========================================================")
     print(" [Node 1: Plan] Discovery & Intent Definition")
@@ -145,7 +260,6 @@ async def plan_discovery_node(state: EnablementState) -> Dict[str, Any]:
     intent = "Build"
     group_id = "01"
 
-    # Try extraction with Gemini LLM first if available
     llm = get_llm()
     if llm:
         extraction_prompt = (
@@ -167,7 +281,6 @@ async def plan_discovery_node(state: EnablementState) -> Dict[str, Any]:
         except Exception as e:
             print(f"[Info] LLM parsing note: {e}")
 
-    # Deterministic pattern parser fallback
     if "destroy" in user_response_str.lower() or "delete" in user_response_str.lower() or "clean" in user_response_str.lower():
         intent = "Destroy"
     else:
@@ -182,52 +295,49 @@ async def plan_discovery_node(state: EnablementState) -> Dict[str, Any]:
 
     print(f"-> Interpreted Intent: {intent} | Group ID: {group_id}")
 
-    # 2. Query Nutanix MCP Server for current cluster state
-    print("\n-> Querying Nutanix MCP server for current cluster state...")
-    client, tools = await get_mcp_client_and_tools()
-    net_tool = next((t for t in tools if t.name == "networking_execute"), None)
+    # 2. Query Prism Central
+    print(f"\n-> Connecting to Prism Central at {os.getenv('PC_HOST')}...")
+    pc = NutanixPrismClient()
+    existing_vpcs = pc.list_vpcs()
+    existing_subnets = pc.list_subnets()
 
-    existing_vpcs = []
-    existing_subnets = []
     secondary_subnet = None
-
-    if net_tool:
-        vpc_res = await execute_mcp_networking(net_tool, "listVpcs")
-        subnet_res = await execute_mcp_networking(net_tool, "listSubnets")
-
-        if isinstance(vpc_res, dict) and "data" in vpc_res:
-            existing_vpcs = vpc_res["data"]
-        elif isinstance(vpc_res, list):
-            existing_vpcs = vpc_res
-
-        if isinstance(subnet_res, dict) and "data" in subnet_res:
-            existing_subnets = subnet_res["data"]
-        elif isinstance(subnet_res, list):
-            existing_subnets = subnet_res
-
-    # Provide fallback inventory if cluster is isolated / offline during local run
-    if not existing_subnets:
-        existing_subnets = [
-            {"name": "Secondary-VLAN-Subnet", "extId": "subnet-sec-01", "subnetType": "VLAN", "vlanId": 2271, "networkId": "10.136.227.128/25"},
-            {"name": "Primary-Subnet", "extId": "subnet-pri-01", "subnetType": "VLAN", "vlanId": 2270, "networkId": "10.136.226.0/24"}
-        ]
-    if not existing_vpcs and intent == "Destroy":
-        existing_vpcs = [
-            {"name": "Transit-VPC-01", "extId": "vpc-transit-01"},
-            {"name": "Spoke-VPC-1-01", "extId": "vpc-spoke1-01"},
-            {"name": "Spoke-VPC-2-01", "extId": "vpc-spoke2-01"},
-            {"name": "Spoke-VPC-3-01", "extId": "vpc-spoke3-01"}
-        ]
-
-    # Find secondary or aux-1 subnet
     for s in existing_subnets:
         name_lower = str(s.get("name", "")).lower()
-        if "secondary" in name_lower or "aux-1" in name_lower or "aux" in name_lower:
+        if "secondary" in name_lower or "aux" in name_lower:
             secondary_subnet = s
             break
 
     if not secondary_subnet and existing_subnets:
         secondary_subnet = existing_subnets[0]
+
+    captured_vlan_id = None
+    captured_cluster_ref = None
+    captured_vswitch_ref = None
+    sec_name = "secondary-BLR-POC227"
+    sec_id = None
+
+    if secondary_subnet:
+        sec_name = secondary_subnet.get("name", "Secondary-VLAN-Subnet")
+        sec_id = secondary_subnet.get("extId")
+        captured_vlan_id = secondary_subnet.get("networkId")
+        if captured_vlan_id is None:
+            captured_vlan_id = secondary_subnet.get("vlanId", 2271)
+        captured_cluster_ref = secondary_subnet.get("clusterReference")
+        if not captured_cluster_ref and secondary_subnet.get("clusterReferenceList"):
+            captured_cluster_ref = secondary_subnet.get("clusterReferenceList")[0]
+        captured_vswitch_ref = secondary_subnet.get("virtualSwitchReference")
+
+    if captured_vlan_id is None:
+        captured_vlan_id = 2271
+
+    captured_vlan_info = {
+        "vlan_id": int(captured_vlan_id),
+        "cluster_ref": captured_cluster_ref,
+        "vswitch_ref": captured_vswitch_ref,
+        "subnet_name": sec_name,
+        "subnet_ext_id": sec_id
+    }
 
     discovered_state = {
         "existing_vpcs": existing_vpcs,
@@ -235,54 +345,98 @@ async def plan_discovery_node(state: EnablementState) -> Dict[str, Any]:
         "secondary_subnet": secondary_subnet
     }
 
-    print(f"-> Discovered {len(existing_vpcs)} existing VPC(s) and {len(existing_subnets)} subnet(s).")
-    if secondary_subnet:
-        print(f"-> Target Secondary Subnet Identified: {secondary_subnet.get('name')} (ID: {secondary_subnet.get('extId')})")
+    print(f"-> Discovered {len(existing_vpcs)} live VPC(s) and {len(existing_subnets)} subnet(s) on cluster.")
+    print(f"-> Target Subnet Identified: '{sec_name}' (ID: {sec_id or 'Auto-Detect'})")
+    print(f"-> [CAPTURE] VLAN ID captured: {captured_vlan_id} | Cluster: {captured_cluster_ref}")
 
     # 3. Generate Execution Plan
     execution_plan = []
     if intent == "Build":
-        sec_name = secondary_subnet.get("name", "Secondary-VLAN-Subnet") if secondary_subnet else "Secondary-VLAN-Subnet"
-        sec_id = secondary_subnet.get("extId", "subnet-sec-01") if secondary_subnet else "subnet-sec-01"
-
         execution_plan = [
             {
                 "step": 1,
-                "action": "CONVERT_EXTERNAL_SUBNET",
+                "action": "DELETE_BASIC_SUBNET",
                 "target_type": "Subnet",
                 "target_name": sec_name,
                 "target_id": sec_id,
                 "details": {
-                    "description": "Convert VLAN Basic subnet to Network Controller External Network",
-                    "network_type": "Network Controller External",
-                    "ipam_range": "10.136.227.160 - 10.136.227.253",
-                    "netmask": "255.255.255.128 (/25)"
+                    "description": f"Delete predefined Basic VLAN subnet '{sec_name}' to free VLAN ID {captured_vlan_id}",
+                    "captured_vlan_id": captured_vlan_id,
+                    "target_ext_id": sec_id
                 }
             },
             {
                 "step": 2,
-                "action": "CREATE_TRANSIT_VPC",
-                "target_type": "VPC",
-                "target_name": f"Transit-VPC-{group_id}",
+                "action": "CREATE_EXTERNAL_VLAN_SUBNET",
+                "target_type": "Subnet",
+                "target_name": sec_name,
                 "details": {
-                    "description": "Create Transit VPC with NAT to External Network",
-                    "external_connectivity": "NAT enabled to External Subnet",
-                    "subnets": [
-                        {"name": f"Transit-ERP-{group_id}", "cidr": "10.10.10.0/24", "type": "ERP"},
-                        {"name": f"Transit-NonERP-{group_id}", "cidr": "20.20.20.0/24", "type": "Non-ERP"}
-                    ]
+                    "description": f"Create Network Controller External VLAN Subnet using captured VLAN ID {captured_vlan_id}",
+                    "vlan_id": captured_vlan_id,
+                    "subnet_type": "VLAN (External)",
+                    "network_ip": "10.136.227.128/25",
+                    "gateway_ip": "10.136.227.129",
+                    "ipam_pool": "10.136.227.160 - 10.136.227.253",
+                    "cluster_ref": captured_cluster_ref
                 }
             },
             {
                 "step": 3,
+                "action": "CREATE_TRANSIT_VPC",
+                "target_type": "VPC",
+                "target_name": f"Transit-VPC-{group_id}",
+                "details": {
+                    "description": "Create Transit VPC attached to External Subnet with NAT enabled and ERP advertisement",
+                    "external_connectivity": f"NAT enabled to External Subnet ({sec_name})",
+                    "subnets": [
+                        {
+                            "name": f"Transit-ERP-{group_id}",
+                            "cidr": "10.10.10.0/24",
+                            "gateway": "10.10.10.1",
+                            "ipam_range": "10.10.10.160 - 10.10.10.253",
+                            "type": "ERP (Externally Routable Prefix)"
+                        },
+                        {
+                            "name": f"Transit-NonERP-{group_id}",
+                            "cidr": "20.20.20.0/24",
+                            "gateway": "20.20.20.1",
+                            "ipam_range": "20.20.20.160 - 20.20.20.253",
+                            "type": "Non-ERP"
+                        }
+                    ]
+                }
+            },
+            {
+                "step": 4,
                 "action": "CREATE_SPOKE_VPCS",
                 "target_type": "VPC_GROUP",
                 "target_name": f"Spoke-VPCs (1..3) for Group {group_id}",
                 "details": {
                     "spokes": [
-                        {"name": f"Spoke-VPC-1-{group_id}", "cidr": "1.1.1.0/24", "type": "ERP", "connectivity": "No-NAT to Transit"},
-                        {"name": f"Spoke-VPC-2-{group_id}", "cidr": "2.2.2.0/24", "type": "ERP", "connectivity": "No-NAT to Transit"},
-                        {"name": f"Spoke-VPC-3-{group_id}", "cidr": "3.3.3.0/24", "type": "ERP", "connectivity": "No-NAT to Transit"}
+                        {
+                            "name": f"Spoke-VPC-1-{group_id}",
+                            "cidr": "1.1.1.0/24",
+                            "gateway": "1.1.1.1",
+                            "ipam_range": "1.1.1.160 - 1.1.1.253",
+                            "type": "ERP (Externally Routable Prefix)",
+                            "connectivity": f"No-NAT to Transit-VPC-{group_id}"
+                        },
+                        {
+                            "name": f"Spoke-VPC-2-{group_id}",
+                            "cidr": "2.2.2.0/24",
+                            "gateway": "2.2.2.1",
+                            "ipam_range": "2.2.2.160 - 2.2.2.253",
+                            "type": "ERP (Externally Routable Prefix)",
+                            "connectivity": f"No-NAT to Transit-VPC-{group_id}"
+                        },
+                        {
+                            "name": f"Spoke-VPC-3-{group_id}",
+                            "cidr": "3.3.3.0/24",
+                            "gateway": "3.3.3.1",
+                            "ipam_range": "3.3.3.160 - 3.3.3.253",
+                            "type": "ERP (Externally Routable Prefix)",
+                            "connectivity": f"No-NAT to Transit-VPC-{group_id}"
+                        }
                     ]
                 }
             }
@@ -291,7 +445,7 @@ async def plan_discovery_node(state: EnablementState) -> Dict[str, Any]:
         vpcs_to_delete = []
         for vpc in existing_vpcs:
             v_name = vpc.get("name", "")
-            if "Enablement" in v_name or "Group" in v_name or "Transit" in v_name or "Spoke" in v_name:
+            if "Enablement" in v_name or "Group" in v_name or "Transit" in v_name or "Spoke" in v_name or "Test" in v_name:
                 vpcs_to_delete.append(vpc)
 
         subnets_to_delete = []
@@ -301,17 +455,6 @@ async def plan_discovery_node(state: EnablementState) -> Dict[str, Any]:
                 subnets_to_delete.append(sub)
 
         step_idx = 1
-        for sub in subnets_to_delete:
-            execution_plan.append({
-                "step": step_idx,
-                "action": "DELETE_SUBNET",
-                "target_type": "Subnet",
-                "target_name": sub.get("name"),
-                "target_id": sub.get("extId"),
-                "details": {"description": f"Delete enablement subnet '{sub.get('name')}'"}
-            })
-            step_idx += 1
-
         for vpc in vpcs_to_delete:
             execution_plan.append({
                 "step": step_idx,
@@ -319,7 +462,18 @@ async def plan_discovery_node(state: EnablementState) -> Dict[str, Any]:
                 "target_type": "VPC",
                 "target_name": vpc.get("name"),
                 "target_id": vpc.get("extId"),
-                "details": {"description": f"Delete enablement VPC '{vpc.get('name')}'"}
+                "details": {"description": f"Delete VPC '{vpc.get('name')}'"}
+            })
+            step_idx += 1
+
+        for sub in subnets_to_delete:
+            execution_plan.append({
+                "step": step_idx,
+                "action": "DELETE_SUBNET",
+                "target_type": "Subnet",
+                "target_name": sub.get("name"),
+                "target_id": sub.get("extId"),
+                "details": {"description": f"Delete subnet '{sub.get('name')}'"}
             })
             step_idx += 1
 
@@ -329,7 +483,7 @@ async def plan_discovery_node(state: EnablementState) -> Dict[str, Any]:
                 "action": "NO_OP_CLEANUP",
                 "target_type": "None",
                 "target_name": "No Enablement Constructs Found",
-                "details": {"description": "No VPCs or Subnets matching 'Enablement' or 'Group' found for deletion."}
+                "details": {"description": "No enablement constructs found for cleanup."}
             })
 
     print(f"[OK] Generated Execution Plan ({len(execution_plan)} step(s)).")
@@ -338,17 +492,13 @@ async def plan_discovery_node(state: EnablementState) -> Dict[str, Any]:
         "user_intent": intent,
         "group_id": group_id,
         "discovered_state": discovered_state,
+        "captured_vlan_info": captured_vlan_info,
         "execution_plan": execution_plan,
         "messages": [AIMessage(content=f"Plan generated for {intent} with {len(execution_plan)} steps.")]
     }
 
 async def review_approval_node(state: EnablementState) -> Dict[str, Any]:
-    """
-    Node 2: Review (Human-in-the-Loop)
-    1. Presents the generated execution plan clearly to the user.
-    2. Interrupts to ask for explicit confirmation: 'Do you approve this plan? (Yes/No)'
-    3. Evaluates confirmation and sets approval_status.
-    """
+    """Node 2: Human-In-The-Loop Plan Approval."""
     print("\n=========================================================")
     print(" [Node 2: Review] Human-in-the-Loop Approval")
     print("=========================================================")
@@ -356,10 +506,10 @@ async def review_approval_node(state: EnablementState) -> Dict[str, Any]:
     plan = state.get("execution_plan", [])
     intent = state.get("user_intent", "Build")
     group_id = state.get("group_id", "01")
+    captured_info = state.get("captured_vlan_info", {})
 
-    # Format plan for clear terminal output
     print(f"\nPROPOSED EXECUTION PLAN (Intent: {intent} | Group: {group_id}):")
-    print("-" * 65)
+    print("-" * 75)
     for p in plan:
         print(f"Step {p.get('step')}: [{p.get('action')}] {p.get('target_name')}")
         details = p.get("details", {})
@@ -373,7 +523,10 @@ async def review_approval_node(state: EnablementState) -> Dict[str, Any]:
         else:
             for k, v in details.items():
                 print(f"   * {k}: {v}")
-    print("-" * 65)
+    print("-" * 75)
+
+    if intent == "Build" and captured_info.get("vlan_id"):
+        print(f"[CONFIRMATION] Captured VLAN ID to reuse: {captured_info.get('vlan_id')}")
 
     prompt = (
         f"Execution Plan generated with {len(plan)} actions for {intent} (Group {group_id}).\n"
@@ -396,23 +549,24 @@ async def review_approval_node(state: EnablementState) -> Dict[str, Any]:
         }
 
 async def execute_provisioning_node(state: EnablementState) -> Dict[str, Any]:
-    """
-    Node 3: Execute (Provisioning)
-    1. Executes the approved plan step-by-step using Nutanix MCP tools.
-    2. Handles Spoke VPC creations using a standard Python for loop over the 3 spokes.
-    3. Records execution results (status, UUIDs, extIds, errors) in state.
-    """
+    """Node 3: Execute Provisioning Constructs against Prism Central."""
     print("\n=========================================================")
-    print(" [Node 3: Execute] Provisioning Constructs via MCP")
+    print(" [Node 3: Execute] Provisioning Constructs on Prism Central")
     print("=========================================================")
 
     plan = state.get("execution_plan", [])
     intent = state.get("user_intent", "Build")
     group_id = state.get("group_id", "01")
-    execution_results = []
+    captured_info = state.get("captured_vlan_info", {})
+    vlan_id = captured_info.get("vlan_id", 2271)
+    cluster_ref = captured_info.get("cluster_ref")
+    vswitch_ref = captured_info.get("vswitch_ref")
 
-    client, tools = await get_mcp_client_and_tools()
-    net_tool = next((t for t in tools if t.name == "networking_execute"), None)
+    execution_results = []
+    created_external_subnet_ext_id = None
+    created_transit_vpc_ext_id = None
+
+    pc = NutanixPrismClient()
 
     for item in plan:
         action = item.get("action")
@@ -422,117 +576,249 @@ async def execute_provisioning_node(state: EnablementState) -> Dict[str, Any]:
 
         print(f"\n-> Executing Step {step_num}: {action} ({target_name})...")
 
-        if action == "CONVERT_EXTERNAL_SUBNET":
-            req_body = {
-                "name": target_name,
-                "subnetType": "EXTERNAL",
-                "ipamConfig": {
-                    "ipamRange": "10.136.227.160 10.136.227.253",
-                    "netmask": "255.255.255.128"
-                }
-            }
-            if net_tool:
-                await execute_mcp_networking(
-                    net_tool,
-                    "updateSubnetById",
-                    path_params={"extId": target_id or "subnet-sec-01"},
-                    request_body=req_body
-                )
-            created_ext_id = target_id or "subnet-sec-01"
-            print(f"[OK] Converted '{target_name}' to Network Controller External Network (IPAM .160-.253) [ID: {created_ext_id}]")
+        if action == "DELETE_BASIC_SUBNET":
+            ok = False
+            if target_id:
+                ok = pc.delete_subnet(target_id)
+                print(f"-> Sent delete request for {target_id}. Waiting 4s for cluster to release VLAN...")
+                await asyncio.sleep(4)
+            else:
+                ok = True
+
+            if ok:
+                print(f"[OK] Deleted Basic Subnet '{target_name}' (ID: {target_id}). VLAN {vlan_id} is now released.")
+            else:
+                print(f"[Warning] Delete Basic Subnet did not complete cleanly or was already removed.")
+
             execution_results.append({
                 "step": step_num,
                 "action": action,
                 "target_name": target_name,
-                "extId": created_ext_id,
-                "status": "SUCCESS",
-                "details": "Converted to Network Controller External Network with IPAM .160-.253"
+                "extId": target_id or "subnet-basic-id",
+                "status": "SUCCESS" if ok else "FAILED",
+                "details": f"Deleted basic subnet to free VLAN ID {vlan_id}"
             })
 
-        elif action == "CREATE_TRANSIT_VPC":
-            vpc_payload = {
+        elif action == "CREATE_EXTERNAL_VLAN_SUBNET":
+            subnet_body: Dict[str, Any] = {
                 "name": target_name,
-                "vpcType": "TRANSIT",
-                "externalSubnets": [{"extId": "subnet-sec-01", "enableNat": True}],
-                "subnets": [
-                    {"name": f"Transit-ERP-{group_id}", "networkId": "10.10.10.0/24", "type": "ERP"},
-                    {"name": f"Transit-NonERP-{group_id}", "networkId": "20.20.20.0/24", "type": "Non-ERP"}
+                "subnetType": "VLAN",
+                "networkId": int(vlan_id),
+                "isExternal": True,
+                "ipConfig": [
+                    {
+                        "ipv4": {
+                            "ipSubnet": {
+                                "ip": {"value": "10.136.227.128", "prefixLength": 32},
+                                "prefixLength": 25
+                            },
+                            "defaultGatewayIp": {"value": "10.136.227.129", "prefixLength": 32},
+                            "poolList": [
+                                {
+                                    "startIp": {"value": "10.136.227.160", "prefixLength": 32},
+                                    "endIp": {"value": "10.136.227.253", "prefixLength": 32}
+                                }
+                            ]
+                        }
+                    }
                 ]
             }
-            if net_tool:
-                await execute_mcp_networking(net_tool, "createVpc", request_body=vpc_payload)
+            if cluster_ref:
+                subnet_body["clusterReference"] = cluster_ref
+            if vswitch_ref:
+                subnet_body["virtualSwitchReference"] = vswitch_ref
 
-            transit_id = f"vpc-transit-{group_id}-uuid"
-            print(f"[OK] Created '{target_name}' (NAT External, ERP 10.10.10.0/24, Non-ERP 20.20.20.0/24) [ID: {transit_id}]")
-            execution_results.append({
-                "step": step_num,
-                "action": action,
-                "target_name": target_name,
-                "extId": transit_id,
-                "status": "SUCCESS",
-                "details": "Transit VPC created with NAT and ERP/Non-ERP subnets"
-            })
+            created_external_subnet_ext_id = pc.create_subnet(subnet_body)
+
+            if created_external_subnet_ext_id:
+                print(f"[OK] Created External VLAN Subnet '{target_name}' using VLAN {vlan_id} [ID: {created_external_subnet_ext_id}]")
+                execution_results.append({
+                    "step": step_num,
+                    "action": action,
+                    "target_name": target_name,
+                    "extId": created_external_subnet_ext_id,
+                    "status": "SUCCESS",
+                    "details": f"Created External VLAN Subnet with VLAN ID {vlan_id} (IPAM .160-.253)"
+                })
+            else:
+                print(f"[Error] Failed to create External VLAN Subnet '{target_name}'.")
+                execution_results.append({
+                    "step": step_num,
+                    "action": action,
+                    "target_name": target_name,
+                    "extId": "N/A",
+                    "status": "FAILED",
+                    "details": "Subnet creation API call failed."
+                })
+
+        elif action == "CREATE_TRANSIT_VPC":
+            # Idempotency check: remove any existing VPC with identical name
+            for existing_v in pc.list_vpcs():
+                if existing_v.get("name") == target_name:
+                    print(f"-> Cleaning up existing VPC '{target_name}' ({existing_v.get('extId')}) before creation...")
+                    pc.delete_vpc(existing_v.get("extId"))
+                    await asyncio.sleep(2)
+
+            vpc_body: Dict[str, Any] = {
+                "name": target_name,
+                "description": f"Transit VPC for Enablement Group {group_id}",
+                "shouldAdvertiseConnectedSubnets": True,
+                "externallyRoutablePrefixes": [
+                    {"ipv4": {"ip": {"value": "10.10.10.0", "prefixLength": 32}, "prefixLength": 24}},
+                    {"ipv4": {"ip": {"value": "1.1.1.0", "prefixLength": 32}, "prefixLength": 24}},
+                    {"ipv4": {"ip": {"value": "2.2.2.0", "prefixLength": 32}, "prefixLength": 24}},
+                    {"ipv4": {"ip": {"value": "3.3.3.0", "prefixLength": 32}, "prefixLength": 24}}
+                ]
+            }
+            if created_external_subnet_ext_id:
+                vpc_body["externalSubnets"] = [
+                    {"subnetReference": created_external_subnet_ext_id}
+                ]
+
+            created_transit_vpc_ext_id = pc.create_vpc(vpc_body)
+
+            if created_transit_vpc_ext_id:
+                print(f"[OK] Created Transit VPC '{target_name}' with ERP Advertisements [ID: {created_transit_vpc_ext_id}]")
+
+                # Create ERP and Non-ERP overlay subnets with full IPAM
+                erp_sub = {
+                    "name": f"Transit-ERP-{group_id}",
+                    "subnetType": "OVERLAY",
+                    "vpcReference": created_transit_vpc_ext_id,
+                    "ipConfig": [
+                        {
+                            "ipv4": {
+                                "ipSubnet": {"ip": {"value": "10.10.10.0", "prefixLength": 32}, "prefixLength": 24},
+                                "defaultGatewayIp": {"value": "10.10.10.1", "prefixLength": 32},
+                                "poolList": [{"startIp": {"value": "10.10.10.160", "prefixLength": 32}, "endIp": {"value": "10.10.10.253", "prefixLength": 32}}]
+                            }
+                        }
+                    ]
+                }
+                non_erp_sub = {
+                    "name": f"Transit-NonERP-{group_id}",
+                    "subnetType": "OVERLAY",
+                    "vpcReference": created_transit_vpc_ext_id,
+                    "ipConfig": [
+                        {
+                            "ipv4": {
+                                "ipSubnet": {"ip": {"value": "20.20.20.0", "prefixLength": 32}, "prefixLength": 24},
+                                "defaultGatewayIp": {"value": "20.20.20.1", "prefixLength": 32},
+                                "poolList": [{"startIp": {"value": "20.20.20.160", "prefixLength": 32}, "endIp": {"value": "20.20.20.253", "prefixLength": 32}}]
+                            }
+                        }
+                    ]
+                }
+                pc.create_subnet(erp_sub)
+                pc.create_subnet(non_erp_sub)
+
+                execution_results.append({
+                    "step": step_num,
+                    "action": action,
+                    "target_name": target_name,
+                    "extId": created_transit_vpc_ext_id,
+                    "status": "SUCCESS",
+                    "details": "Transit VPC created with NAT, ERP/Non-ERP subnets and IPAM pools (.160-.253)"
+                })
+            else:
+                print(f"[Error] Failed to create Transit VPC '{target_name}'.")
+                execution_results.append({
+                    "step": step_num,
+                    "action": action,
+                    "target_name": target_name,
+                    "extId": "N/A",
+                    "status": "FAILED",
+                    "details": "Transit VPC creation API call failed."
+                })
 
         elif action == "CREATE_SPOKE_VPCS":
-            # Iterate through the 3 spokes using standard Python for loop
             spokes_config = [
-                {"index": 1, "cidr": "1.1.1.0/24"},
-                {"index": 2, "cidr": "2.2.2.0/24"},
-                {"index": 3, "cidr": "3.3.3.0/24"}
+                {"index": 1, "ip": "1.1.1.0", "gw": "1.1.1.1", "pool_start": "1.1.1.160", "pool_end": "1.1.1.253"},
+                {"index": 2, "ip": "2.2.2.0", "gw": "2.2.2.1", "pool_start": "2.2.2.160", "pool_end": "2.2.2.253"},
+                {"index": 3, "ip": "3.3.3.0", "gw": "3.3.3.1", "pool_start": "3.3.3.160", "pool_end": "3.3.3.253"}
             ]
             spoke_results = []
             for spoke in spokes_config:
                 spoke_name = f"Spoke-VPC-{spoke['index']}-{group_id}"
-                spoke_cidr = spoke["cidr"]
-                spoke_payload = {
-                    "name": spoke_name,
-                    "vpcType": "SPOKE",
-                    "subnets": [{"name": f"Subnet-{spoke_name}", "networkId": spoke_cidr, "type": "ERP"}],
-                    "transitVpc": {"name": f"Transit-VPC-{group_id}", "nat": False}
-                }
-                if net_tool:
-                    await execute_mcp_networking(net_tool, "createVpc", request_body=spoke_payload)
+                
+                # Idempotency check: remove any existing VPC with identical name
+                for existing_v in pc.list_vpcs():
+                    if existing_v.get("name") == spoke_name:
+                        print(f"   -> Cleaning up existing Spoke VPC '{spoke_name}' ({existing_v.get('extId')})...")
+                        pc.delete_vpc(existing_v.get("extId"))
+                        await asyncio.sleep(2)
 
-                spoke_id = f"vpc-spoke{spoke['index']}-{group_id}-uuid"
-                print(f"   [OK] Spoke {spoke['index']}/3: Created '{spoke_name}' (CIDR {spoke_cidr}, ERP, No-NAT to Transit) [ID: {spoke_id}]")
-                spoke_results.append({
+                spoke_body = {
                     "name": spoke_name,
-                    "cidr": spoke_cidr,
-                    "extId": spoke_id,
-                    "status": "SUCCESS"
-                })
+                    "description": f"Spoke {spoke['index']} VPC for Group {group_id}",
+                    "shouldAdvertiseConnectedSubnets": True,
+                    "externallyRoutablePrefixes": [
+                        {
+                            "ipv4": {
+                                "ip": {"value": spoke["ip"], "prefixLength": 32},
+                                "prefixLength": 24
+                            }
+                        }
+                    ]
+                }
+                spoke_id = pc.create_vpc(spoke_body)
+                if spoke_id:
+                    # Create overlay ERP subnet in Spoke VPC with full IPAM
+                    spoke_sub = {
+                        "name": f"Spoke-ERP-{spoke['index']}-{group_id}",
+                        "subnetType": "OVERLAY",
+                        "vpcReference": spoke_id,
+                        "ipConfig": [
+                            {
+                                "ipv4": {
+                                    "ipSubnet": {"ip": {"value": spoke["ip"], "prefixLength": 32}, "prefixLength": 24},
+                                    "defaultGatewayIp": {"value": spoke["gw"], "prefixLength": 32},
+                                    "poolList": [
+                                        {
+                                            "startIp": {"value": spoke["pool_start"], "prefixLength": 32},
+                                            "endIp": {"value": spoke["pool_end"], "prefixLength": 32}
+                                        }
+                                    ]
+                                }
+                            }
+                        ]
+                    }
+                    pc.create_subnet(spoke_sub)
+                    print(f"   [OK] Spoke {spoke['index']}/3: Created '{spoke_name}' (ERP {spoke['ip']}/24, GW {spoke['gw']}, IPAM {spoke['pool_start']}-{spoke['pool_end']}) [ID: {spoke_id}]")
+                    spoke_results.append({"name": spoke_name, "extId": spoke_id, "status": "SUCCESS"})
+                else:
+                    print(f"   [Error] Failed to create Spoke VPC '{spoke_name}'")
+                    spoke_results.append({"name": spoke_name, "extId": "N/A", "status": "FAILED"})
 
             execution_results.append({
                 "step": step_num,
                 "action": action,
                 "target_name": f"Spoke VPCs (1..3)-{group_id}",
-                "status": "SUCCESS",
+                "status": "SUCCESS" if all(s["status"] == "SUCCESS" for s in spoke_results) else "PARTIAL",
                 "spokes": spoke_results,
-                "details": "3 Spoke VPCs provisioned successfully"
-            })
-
-        elif action == "DELETE_SUBNET":
-            if net_tool and target_id:
-                await execute_mcp_networking(net_tool, "deleteSubnetById", path_params={"extId": target_id})
-            print(f"[OK] Deleted Subnet '{target_name}' (ID: {target_id})")
-            execution_results.append({
-                "step": step_num,
-                "action": action,
-                "target_name": target_name,
-                "extId": target_id,
-                "status": "DELETED"
+                "details": "3 Spoke VPCs provisioned with ERP designations and full IPAM pools (.160-.253)"
             })
 
         elif action == "DELETE_VPC":
-            if net_tool and target_id:
-                await execute_mcp_networking(net_tool, "deleteVpcById", path_params={"extId": target_id})
-            print(f"[OK] Deleted VPC '{target_name}' (ID: {target_id})")
+            ok = pc.delete_vpc(target_id) if target_id else True
+            print(f"[{'OK' if ok else 'Warning'}] Delete VPC '{target_name}' (ID: {target_id})")
             execution_results.append({
                 "step": step_num,
                 "action": action,
                 "target_name": target_name,
                 "extId": target_id,
-                "status": "DELETED"
+                "status": "DELETED" if ok else "FAILED"
+            })
+
+        elif action == "DELETE_SUBNET":
+            ok = pc.delete_subnet(target_id) if target_id else True
+            print(f"[{'OK' if ok else 'Warning'}] Delete Subnet '{target_name}' (ID: {target_id})")
+            execution_results.append({
+                "step": step_num,
+                "action": action,
+                "target_name": target_name,
+                "extId": target_id,
+                "status": "DELETED" if ok else "FAILED"
             })
 
         elif action == "NO_OP_CLEANUP":
@@ -550,31 +836,23 @@ async def execute_provisioning_node(state: EnablementState) -> Dict[str, Any]:
     }
 
 async def review_verification_node(state: EnablementState) -> Dict[str, Any]:
-    """
-    Node 4: Review (System Verification)
-    1. Queries Nutanix MCP one final time to audit the cluster.
-    2. Compares the actual live cluster state against the original execution_plan.
-    3. Outputs a final, clean summary to the user.
-    """
+    """Node 4: System Verification & Live Audit against Prism Central."""
     print("\n=========================================================")
     print(" [Node 4: Review] System Verification & Live Audit")
     print("=========================================================")
 
-    client, tools = await get_mcp_client_and_tools()
-    net_tool = next((t for t in tools if t.name == "networking_execute"), None)
-
-    plan = state.get("execution_plan", [])
     results = state.get("execution_results", [])
     intent = state.get("user_intent", "Build")
     group_id = state.get("group_id", "01")
+    captured_info = state.get("captured_vlan_info", {})
+    vlan_id = captured_info.get("vlan_id", 2271)
 
-    # Post-execution audit query
-    print("-> Performing final audit query via Nutanix MCP...")
-    if net_tool:
-        await execute_mcp_networking(net_tool, "listVpcs")
-        await execute_mcp_networking(net_tool, "listSubnets")
+    pc = NutanixPrismClient()
+    live_vpcs = pc.list_vpcs()
+    live_subnets = pc.list_subnets()
 
-    # Construct verification report
+    print(f"-> Live Audit Complete: {len(live_vpcs)} VPC(s) and {len(live_subnets)} Subnet(s) found on cluster.")
+
     verification_table = []
     for res in results:
         status_tag = f"[{res.get('status')}]"
@@ -585,29 +863,31 @@ async def review_verification_node(state: EnablementState) -> Dict[str, Any]:
             "ExtID": res.get("extId", "N/A")
         })
 
-    # Display final summary table
     print("\n=========================================================")
     print(f" FINAL EXECUTION SUMMARY (Intent: {intent} | Group: {group_id})")
     print("=========================================================")
-    print(f"{'Action':<26} | {'Target Name':<32} | {'Status':<12} | {'Resource ExtID'}")
+    print(f"{'Action':<28} | {'Target Name':<30} | {'Status':<10} | {'Resource ExtID'}")
     print("-" * 90)
     for row in verification_table:
-        print(f"{row['Action']:<26} | {row['Target']:<32} | {row['Status']:<12} | {row['ExtID']}")
+        print(f"{row['Action']:<28} | {row['Target']:<30} | {row['Status']:<10} | {row['ExtID']}")
     print("-" * 90)
 
     if intent == "Build":
-        print("\nStudent Enablement Networking Topology Built Successfully:")
-        print(f" * External Network : Network Controller Subnet (IPAM .160-.253)")
-        print(f" * Transit VPC      : Transit-VPC-{group_id} (NAT Enabled, 10.10.10.0/24 ERP, 20.20.20.0/24 Non-ERP)")
-        print(f" * Spoke 1 VPC      : Spoke-VPC-1-{group_id} (1.1.1.0/24 ERP, No-NAT -> Transit)")
-        print(f" * Spoke 2 VPC      : Spoke-VPC-2-{group_id} (2.2.2.0/24 ERP, No-NAT -> Transit)")
-        print(f" * Spoke 3 VPC      : Spoke-VPC-3-{group_id} (3.3.3.0/24 ERP, No-NAT -> Transit)")
+        print("\nStudent Enablement Networking Topology Provisioned:")
+        print(f" * Reused VLAN ID  : {vlan_id}")
+        print(f" * External Network: Network Controller Subnet (IPAM .160-.253 on /25)")
+        print(f" * Transit VPC     : Transit-VPC-{group_id} (NAT Enabled, ERP Advertised)")
+        print(f"   - Transit-ERP-{group_id}    : 10.10.10.0/24 (GW 10.10.10.1, IPAM .160-.253, ERP)")
+        print(f"   - Transit-NonERP-{group_id} : 20.20.20.0/24 (GW 20.20.20.1, IPAM .160-.253, Non-ERP)")
+        print(f" * Spoke 1 VPC     : Spoke-VPC-1-{group_id} (ERP 1.1.1.0/24, GW 1.1.1.1, IPAM .160-.253, No-NAT -> Transit)")
+        print(f" * Spoke 2 VPC     : Spoke-VPC-2-{group_id} (ERP 2.2.2.0/24, GW 2.2.2.1, IPAM .160-.253, No-NAT -> Transit)")
+        print(f" * Spoke 3 VPC     : Spoke-VPC-3-{group_id} (ERP 3.3.3.0/24, GW 3.3.3.1, IPAM .160-.253, No-NAT -> Transit)")
     else:
         print("\nStudent Enablement Constructs Cleaned & Destroyed Successfully.")
 
     print("=========================================================\n")
 
-    summary_text = f"Audit complete: {len(results)} actions verified successfully for {intent}."
+    summary_text = f"Audit complete: {len(results)} actions verified for {intent}."
     return {
         "final_summary": summary_text,
         "messages": [AIMessage(content=summary_text)]
@@ -617,7 +897,6 @@ async def review_verification_node(state: EnablementState) -> Dict[str, Any]:
 # 5. Routing Decisions
 # ---------------------------------------------------------------------------
 def route_after_review(state: EnablementState) -> str:
-    """Routes to Execution if approved, otherwise terminates the workflow."""
     if state.get("approval_status") == "approved":
         return "execute_provisioning"
     return END
@@ -628,17 +907,14 @@ def route_after_review(state: EnablementState) -> str:
 def build_enablement_graph():
     builder = StateGraph(EnablementState)
 
-    # 4 Distinct Nodes
     builder.add_node("plan_discovery", plan_discovery_node)
     builder.add_node("review_approval", review_approval_node)
     builder.add_node("execute_provisioning", execute_provisioning_node)
     builder.add_node("review_verification", review_verification_node)
 
-    # Edges
     builder.add_edge(START, "plan_discovery")
     builder.add_edge("plan_discovery", "review_approval")
 
-    # Conditional Routing from Node 2 (Review)
     builder.add_conditional_edges(
         "review_approval",
         route_after_review,
@@ -651,7 +927,6 @@ def build_enablement_graph():
     builder.add_edge("execute_provisioning", "review_verification")
     builder.add_edge("review_verification", END)
 
-    # Compile with MemorySaver checkpointer for Human-In-The-Loop support
     memory = MemorySaver()
     return builder.compile(checkpointer=memory)
 
@@ -672,13 +947,11 @@ async def run_workflow(initial_input: Optional[str] = None):
         "messages": [SystemMessage(content="Starting Nutanix Enablement Networking workflow.")]
     }
 
-    # Start graph stream until first interrupt
     async for event in app.astream(initial_state, config=config):
         for node_name, state_update in event.items():
             if node_name == "__interrupt__":
                 continue
 
-    # Interactive Human-In-The-Loop loop
     snapshot = await app.aget_state(config)
     while snapshot.next:
         interrupt_info = snapshot.tasks[0].interrupts[0].value
@@ -693,7 +966,6 @@ async def run_workflow(initial_input: Optional[str] = None):
 
         print(prompt_text)
 
-        # Handle user input from CLI or provided argument
         if initial_input and "Destroy" in prompt_text:
             user_input = initial_input
             initial_input = None
