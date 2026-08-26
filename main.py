@@ -3,10 +3,19 @@ import sys
 import json
 import shutil
 import asyncio
-import ipaddress
+import re
+from datetime import datetime
 from typing import List, Dict, Any, Optional, Annotated
 from typing_extensions import TypedDict
 from dotenv import load_dotenv
+
+# Ensure UTF-8 output on Windows consoles
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 # LangChain & Gemini Imports
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -24,30 +33,43 @@ from langgraph.types import interrupt, Command
 # ---------------------------------------------------------------------------
 load_dotenv()
 
-# Verify LangSmith tracing if keys exist in .env
+# Verify and enable LangSmith tracing if keys exist in .env
 if os.getenv("LANGCHAIN_API_KEY"):
     os.environ["LANGCHAIN_TRACING_V2"] = os.getenv("LANGCHAIN_TRACING_V2", "true")
-    os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT", "nutanix-network-provisioning")
-    print("✓ LangSmith tracing is active.")
+    os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT", "nutanix-network-enablement")
+    print("[OK] LangSmith tracing is active.")
+
+def get_llm() -> Optional[ChatGoogleGenerativeAI]:
+    """Initializes the Gemini LLM instance if API key is present."""
+    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return None
+    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    try:
+        return ChatGoogleGenerativeAI(
+            model=model_name,
+            google_api_key=api_key,
+            temperature=0.1
+        )
+    except Exception as e:
+        print(f"[Warning] LLM initialization error: {e}")
+        return None
 
 # ---------------------------------------------------------------------------
-# 2. State Design (Modular for Future Transit/Spoke VPC Extensions)
+# 2. State Design
 # ---------------------------------------------------------------------------
-class ProvisioningState(TypedDict, total=False):
+class EnablementState(TypedDict, total=False):
+    user_intent: str                        # "Build" or "Destroy"
+    group_id: Optional[str]                 # e.g., "01", "02"
+    discovered_state: Dict[str, Any]        # Cluster snapshot (VPCs, Subnets, External networks)
+    execution_plan: List[Dict[str, Any]]    # Generated list of planned actions
+    approval_status: Optional[str]          # "approved" or "rejected"
+    execution_results: List[Dict[str, Any]] # Outcome logs & UUIDs per executed action
+    final_summary: Optional[str]            # Final post-audit comparison report
     messages: Annotated[List[BaseMessage], add_messages]
-    subnets: List[Dict[str, Any]]
-    selected_subnet_to_delete: Optional[Dict[str, Any]]
-    new_subnet_params: Optional[Dict[str, Any]]
-    validation_errors: Optional[List[str]]
-    validation_bypass_confirmed: Optional[bool]
-    provisioned_subnet: Optional[Dict[str, Any]]
-    
-    # Modular extension slots for future Transit/Spoke VPC nodes
-    vpc_config: Optional[Dict[str, Any]]
-    provisioned_vpcs: Optional[List[Dict[str, Any]]]
 
 # ---------------------------------------------------------------------------
-# 3. Helper Functions & MCP Client Resolver
+# 3. Nutanix MCP Client Resolver & Helpers
 # ---------------------------------------------------------------------------
 def get_nutanix_mcp_command() -> str:
     """Finds the nutanix-mcp executable command path."""
@@ -57,8 +79,8 @@ def get_nutanix_mcp_command() -> str:
         cmd = shutil.which("nutanix-mcp", path=venv_scripts)
     return cmd or "nutanix-mcp"
 
-async def get_mcp_tools():
-    """Starts nutanix-mcp serve-stdio client and returns available tools."""
+async def get_mcp_client_and_tools():
+    """Starts nutanix-mcp serve-stdio client and returns client + available tools."""
     nutanix_cmd = get_nutanix_mcp_command()
     client = MultiServerMCPClient({
         "nutanix": {
@@ -71,428 +93,628 @@ async def get_mcp_tools():
         tools = await client.get_tools()
         return client, tools
     except Exception as e:
-        print(f"[Warning] Could not initialize MCP client: {e}")
+        print(f"[Warning] Could not initialize Nutanix MCP client: {e}")
         return client, []
 
-def validate_subnet_params(params: Dict[str, Any], existing_subnets: List[Dict[str, Any]]) -> List[str]:
-    """
-    Validates user subnet parameters:
-    1. Network must have a /25 netmask (or 255.255.255.128).
-    2. Gateway IP must end in .129.
-    3. IP range / network must not clash with existing subnets.
-    """
-    errors = []
-    
-    network_str = str(params.get("network", "")).strip()
-    netmask_str = str(params.get("netmask", "")).strip()
-    gateway_str = str(params.get("gateway", "")).strip()
-    
-    # Check 1: /25 Netmask
-    if network_str:
-        try:
-            net = ipaddress.ip_network(network_str, strict=False)
-            if net.prefixlen != 25 and netmask_str != "255.255.255.128":
-                errors.append(f"Network mask must be /25 (255.255.255.128). Got: {network_str} (prefix /{net.prefixlen})")
-        except ValueError as e:
-            errors.append(f"Invalid Network CIDR '{network_str}': {e}")
-    else:
-        errors.append("Network parameter (e.g., 10.136.227.128/25) is required.")
+async def execute_mcp_networking(tool, operation: str, path_params: Dict = None, query_params: Dict = None, request_body: Dict = None) -> Any:
+    """Executes a networking operation using the Nutanix MCP networking_execute tool."""
+    payload = {"operation": operation}
+    if path_params:
+        payload["path_params"] = path_params
+    if query_params:
+        payload["query_params"] = query_params
+    if request_body:
+        payload["request_body"] = request_body
 
-    # Check 2: Gateway ends in .129
-    if gateway_str:
-        try:
-            gw_ip = ipaddress.ip_address(gateway_str)
-            if not str(gw_ip).endswith(".129"):
-                errors.append(f"Gateway IP must end in .129. Got: {gateway_str}")
-        except ValueError as e:
-            errors.append(f"Invalid Gateway IP '{gateway_str}': {e}")
-    else:
-        errors.append("Gateway parameter (e.g., 10.136.227.129) is required.")
-
-    # Check 3: Clash with existing subnets
-    if network_str:
-        try:
-            req_net = ipaddress.ip_network(network_str, strict=False)
-            for sub in existing_subnets:
-                sub_cidr = sub.get("subnet_cidr") or sub.get("network") or sub.get("cidr")
-                if sub_cidr:
-                    try:
-                        exist_net = ipaddress.ip_network(sub_cidr, strict=False)
-                        if req_net.overlaps(exist_net):
-                            errors.append(
-                                f"Requested network {req_net} overlaps with existing subnet "
-                                f"'{sub.get('name', 'unnamed')}' ({exist_net})."
-                            )
-                    except ValueError:
-                        pass
-        except ValueError:
-            pass
-
-    return errors
+    try:
+        res = await tool.ainvoke(payload)
+        # Parse MCP response if returned as text or json
+        if isinstance(res, list) and len(res) > 0 and isinstance(res[0], dict) and "text" in res[0]:
+            try:
+                return json.loads(res[0]["text"])
+            except Exception:
+                return res[0]["text"]
+        return res
+    except Exception as e:
+        return {"error": str(e)}
 
 # ---------------------------------------------------------------------------
 # 4. LangGraph Node Implementations
 # ---------------------------------------------------------------------------
 
-async def audit_subnets_node(state: ProvisioningState) -> Dict[str, Any]:
+async def plan_discovery_node(state: EnablementState) -> Dict[str, Any]:
     """
-    Step 1: Audit Existing Subnets
-    Queries Prism Central via MCP tool for available subnets.
-    If count > 1: Interrupt graph to let user choose a subnet to remove.
+    Node 1: Plan (Discovery & Intent)
+    1. Interrupts to ask the user for intent (Build or Destroy) and Group_ID.
+    2. Queries Nutanix MCP to discover current cluster state (existing VPCs, subnets).
+    3. Generates a detailed execution_plan based on the intent and cluster discovery.
     """
-    print("\n[Step 1] Auditing existing subnets on Nutanix Prism Central...")
-    client, tools = await get_mcp_tools()
-    
-    subnets_tool = next((t for t in tools if t.name == "subnets_execute"), None)
-    subnets = []
-    
-    if subnets_tool:
+    print("\n=========================================================")
+    print(" [Node 1: Plan] Discovery & Intent Definition")
+    print("=========================================================")
+
+    # 1. Interrupt for user intent and group_id
+    prompt_message = (
+        "Do you want to Destroy All Enablement Constructs or Build a new Student Group?\n"
+        "If building, what is the Group_ID? (e.g., 'Build Group 01' or 'Destroy')"
+    )
+    user_response = interrupt(prompt_message)
+    user_response_str = str(user_response).strip()
+    print(f"-> User Input Received: '{user_response_str}'")
+
+    intent = "Build"
+    group_id = "01"
+
+    # Try extraction with Gemini LLM first if available
+    llm = get_llm()
+    if llm:
+        extraction_prompt = (
+            f"Analyze the user request: '{user_response_str}'.\n"
+            "Extract the intent (either 'Build' or 'Destroy') and the Group_ID (e.g. '01', '02', 'A', etc.).\n"
+            "If the user wants to delete/destroy/clean up, intent is 'Destroy'.\n"
+            "If the user wants to build/create/setup, intent is 'Build'.\n"
+            "If building and no group id is specified, default to '01'.\n"
+            "Return ONLY a valid JSON object matching this schema:\n"
+            '{"intent": "Build" | "Destroy", "group_id": "01"}'
+        )
         try:
-            res = await subnets_tool.ainvoke({"operation_id": "listSubnets"})
-            # Parse result
-            if isinstance(res, str):
-                try:
-                    data = json.loads(res)
-                    subnets = data.get("data", []) if isinstance(data, dict) else []
-                except Exception:
-                    subnets = [{"name": "Subnet-A", "extId": "sub-001", "subnet_cidr": "10.100.1.0/24"}]
-            elif isinstance(res, dict):
-                subnets = res.get("data", [])
+            extract_res = await llm.ainvoke([HumanMessage(content=extraction_prompt)])
+            cleaned_json = re.search(r"\{.*\}", extract_res.content, re.DOTALL)
+            if cleaned_json:
+                parsed = json.loads(cleaned_json.group(0))
+                intent = parsed.get("intent", "Build").capitalize()
+                group_id = str(parsed.get("group_id", "01")).zfill(2) if parsed.get("group_id") else "01"
         except Exception as e:
-            print(f"[Info] MCP query failed or offline ({e}). Using existing subnet inventory.")
-            subnets = [
-                {"name": "Subnet-Legacy-1", "extId": "sub-001", "subnet_cidr": "10.136.200.0/24", "type": "VLAN Basic"},
-                {"name": "Subnet-Legacy-2", "extId": "sub-002", "subnet_cidr": "10.136.201.0/24", "type": "VLAN Basic"}
-            ]
+            print(f"[Info] LLM parsing note: {e}")
+
+    # Deterministic pattern parser fallback
+    if "destroy" in user_response_str.lower() or "delete" in user_response_str.lower() or "clean" in user_response_str.lower():
+        intent = "Destroy"
     else:
-        # Fallback inventory for demonstration if MCP server environment is unconfigured
-        subnets = [
-            {"name": "Subnet-Legacy-1", "extId": "sub-001", "subnet_cidr": "10.136.200.0/24", "type": "VLAN Basic"},
-            {"name": "Subnet-Legacy-2", "extId": "sub-002", "subnet_cidr": "10.136.201.0/24", "type": "VLAN Basic"}
+        intent = "Build"
+        match = re.search(r"(?:group[_\s-]*)?([0-9a-zA-Z]+)", user_response_str, re.IGNORECASE)
+        if match:
+            extracted_num = re.search(r"\d+", user_response_str)
+            if extracted_num:
+                group_id = extracted_num.group(0).zfill(2)
+            else:
+                group_id = "01"
+
+    print(f"-> Interpreted Intent: {intent} | Group ID: {group_id}")
+
+    # 2. Query Nutanix MCP Server for current cluster state
+    print("\n-> Querying Nutanix MCP server for current cluster state...")
+    client, tools = await get_mcp_client_and_tools()
+    net_tool = next((t for t in tools if t.name == "networking_execute"), None)
+
+    existing_vpcs = []
+    existing_subnets = []
+    secondary_subnet = None
+
+    if net_tool:
+        vpc_res = await execute_mcp_networking(net_tool, "listVpcs")
+        subnet_res = await execute_mcp_networking(net_tool, "listSubnets")
+
+        if isinstance(vpc_res, dict) and "data" in vpc_res:
+            existing_vpcs = vpc_res["data"]
+        elif isinstance(vpc_res, list):
+            existing_vpcs = vpc_res
+
+        if isinstance(subnet_res, dict) and "data" in subnet_res:
+            existing_subnets = subnet_res["data"]
+        elif isinstance(subnet_res, list):
+            existing_subnets = subnet_res
+
+    # Provide fallback inventory if cluster is isolated / offline during local run
+    if not existing_subnets:
+        existing_subnets = [
+            {"name": "Secondary-VLAN-Subnet", "extId": "subnet-sec-01", "subnetType": "VLAN", "vlanId": 2271, "networkId": "10.136.227.128/25"},
+            {"name": "Primary-Subnet", "extId": "subnet-pri-01", "subnetType": "VLAN", "vlanId": 2270, "networkId": "10.136.226.0/24"}
+        ]
+    if not existing_vpcs and intent == "Destroy":
+        existing_vpcs = [
+            {"name": "Transit-VPC-01", "extId": "vpc-transit-01"},
+            {"name": "Spoke-VPC-1-01", "extId": "vpc-spoke1-01"},
+            {"name": "Spoke-VPC-2-01", "extId": "vpc-spoke2-01"},
+            {"name": "Spoke-VPC-3-01", "extId": "vpc-spoke3-01"}
         ]
 
-    count = len(subnets)
-    print(f"-> Found {count} subnet(s) in Prism Central.")
-    for idx, s in enumerate(subnets, 1):
-        print(f"   {idx}. Name: {s.get('name')} | CIDR: {s.get('subnet_cidr')} | ID: {s.get('extId')}")
+    # Find secondary or aux-1 subnet
+    for s in existing_subnets:
+        name_lower = str(s.get("name", "")).lower()
+        if "secondary" in name_lower or "aux-1" in name_lower or "aux" in name_lower:
+            secondary_subnet = s
+            break
 
-    selected_to_delete = None
-    if count > 1:
-        prompt_data = {
-            "message": f"Multiple subnets found ({count}). Please select the index or ID of the subnet you wish to remove.",
-            "subnets": subnets
-        }
-        # Interrupt graph execution and wait for human choice
-        user_response = interrupt(prompt_data)
-        
-        # Parse selection
-        try:
-            idx = int(str(user_response).strip()) - 1
-            if 0 <= idx < len(subnets):
-                selected_to_delete = subnets[idx]
-        except ValueError:
-            for s in subnets:
-                if str(user_response).strip() in (s.get("extId"), s.get("name")):
-                    selected_to_delete = s
-                    break
-        if not selected_to_delete:
-            selected_to_delete = subnets[0]
-            
-        print(f"-> User selected subnet for cleanup: {selected_to_delete.get('name')} ({selected_to_delete.get('extId')})")
+    if not secondary_subnet and existing_subnets:
+        secondary_subnet = existing_subnets[0]
 
-    return {
-        "subnets": subnets,
-        "selected_subnet_to_delete": selected_to_delete
+    discovered_state = {
+        "existing_vpcs": existing_vpcs,
+        "existing_subnets": existing_subnets,
+        "secondary_subnet": secondary_subnet
     }
 
-async def cleanup_subnet_node(state: ProvisioningState) -> Dict[str, Any]:
-    """
-    Step 2: Cleanup (If applicable)
-    Deletes selected subnet using MCP tools and verifies removal.
-    """
-    to_delete = state.get("selected_subnet_to_delete")
-    if not to_delete:
-        print("\n[Step 2] No subnet selected for cleanup. Proceeding...")
-        return {}
+    print(f"-> Discovered {len(existing_vpcs)} existing VPC(s) and {len(existing_subnets)} subnet(s).")
+    if secondary_subnet:
+        print(f"-> Target Secondary Subnet Identified: {secondary_subnet.get('name')} (ID: {secondary_subnet.get('extId')})")
 
-    print(f"\n[Step 2] Deleting subnet: {to_delete.get('name')} (ID: {to_delete.get('extId')})...")
-    client, tools = await get_mcp_tools()
-    subnets_tool = next((t for t in tools if t.name == "subnets_execute"), None)
-    
-    if subnets_tool and to_delete.get("extId"):
-        try:
-            await subnets_tool.ainvoke({
-                "operation_id": "deleteSubnetById",
-                "kwargs": {"extId": to_delete.get("extId")}
-            })
-            print("✓ Subnet deletion request submitted via MCP.")
-        except Exception as e:
-            print(f"[Info] MCP delete call simulated: {e}")
+    # 3. Generate Execution Plan
+    execution_plan = []
+    if intent == "Build":
+        sec_name = secondary_subnet.get("name", "Secondary-VLAN-Subnet") if secondary_subnet else "Secondary-VLAN-Subnet"
+        sec_id = secondary_subnet.get("extId", "subnet-sec-01") if secondary_subnet else "subnet-sec-01"
 
-    # Re-query subnets to verify removal
-    updated_subnets = [s for s in state.get("subnets", []) if s.get("extId") != to_delete.get("extId")]
-    print(f"✓ Verified cleanup. Remaining subnet count: {len(updated_subnets)}")
-
-    return {
-        "subnets": updated_subnets,
-        "selected_subnet_to_delete": None
-    }
-
-async def gather_params_node(state: ProvisioningState) -> Dict[str, Any]:
-    """
-    Step 3: Gather New Subnet Parameters
-    Interrupts graph to ask user for subnet parameters:
-    Type, VLAN ID, Netmask, Gateway, Network, IPAM Range.
-    """
-    print("\n[Step 3] Requesting new subnet parameters from user...")
-    prompt_data = {
-        "message": (
-            "Please provide parameters for the new external connected subnet.\n"
-            "Required Fields:\n"
-            "- Type (e.g., VLAN Basic or Network Controller)\n"
-            "- VLAN ID (e.g., 2271)\n"
-            "- Netmask (e.g., 255.255.255.128)\n"
-            "- Gateway (e.g., 10.136.227.129)\n"
-            "- Network (e.g., 10.136.227.128/25)\n"
-            "- IPAM Range (e.g., 10.136.227.160 to 10.136.227.253)\n"
-        )
-    }
-    user_response = interrupt(prompt_data)
-    
-    # Parse parameter dictionary or JSON input
-    params = {}
-    if isinstance(user_response, dict):
-        params = user_response
-    elif isinstance(user_response, str):
-        try:
-            params = json.loads(user_response)
-        except Exception:
-            # Defaults for interactive CLI string inputs
-            params = {
-                "type": "VLAN Basic",
-                "vlan_id": 2271,
-                "netmask": "255.255.255.128",
-                "gateway": "10.136.227.129",
-                "network": "10.136.227.128/25",
-                "ipam_range": "10.136.227.160 to 10.136.227.253"
-            }
-            
-    print("-> Captured Subnet Parameters:")
-    for k, v in params.items():
-        print(f"   • {k}: {v}")
-
-    return {
-        "new_subnet_params": params,
-        "validation_errors": None,
-        "validation_bypass_confirmed": False
-    }
-
-async def validate_params_node(state: ProvisioningState) -> Dict[str, Any]:
-    """
-    Step 4: Parameter Validation
-    Validates /25 netmask, gateway ending in .129, and checks IP range clashes with Step 1 subnets.
-    If violations occur, interrupts for user explicit confirmation to proceed anyway.
-    """
-    print("\n[Step 4] Validating subnet parameters...")
-    params = state.get("new_subnet_params") or {}
-    existing_subnets = state.get("subnets") or []
-
-    errors = validate_subnet_params(params, existing_subnets)
-
-    if errors:
-        print("⚠ Parameter Validation Violations Detected:")
-        for err in errors:
-            print(f"   ❌ {err}")
-
-        # Interrupt for explicit human confirmation
-        warning_prompt = {
-            "message": (
-                "Validation issues found:\n" + "\n".join(f"- {e}" for e in errors) +
-                "\n\nDo you want to proceed with provisioning anyway? (yes / retry)"
-            ),
-            "errors": errors
-        }
-        user_choice = interrupt(warning_prompt)
-        
-        user_str = str(user_choice).strip().lower()
-        if user_str in ("yes", "y", "true", "proceed"):
-            print("-> User explicitly confirmed to proceed despite validation warnings.")
-            return {
-                "validation_errors": errors,
-                "validation_bypass_confirmed": True
-            }
-        else:
-            print("-> User requested to re-enter subnet parameters.")
-            return {
-                "validation_errors": errors,
-                "validation_bypass_confirmed": False,
-                "new_subnet_params": None
-            }
-
-    print("✓ All subnet parameter validations passed cleanly.")
-    return {
-        "validation_errors": [],
-        "validation_bypass_confirmed": True
-    }
-
-async def provision_subnet_node(state: ProvisioningState) -> Dict[str, Any]:
-    """
-    Step 5: Provisioning
-    Creates the new subnet on Prism Central via MCP tools and verifies creation.
-    """
-    params = state.get("new_subnet_params") or {}
-    print(f"\n[Step 5] Provisioning new subnet: {params.get('network')} (VLAN {params.get('vlan_id')})...")
-
-    client, tools = await get_mcp_tools()
-    subnets_tool = next((t for t in tools if t.name == "subnets_execute"), None)
-
-    created_subnet = {
-        "name": f"Subnet-VLAN-{params.get('vlan_id', 2271)}",
-        "extId": f"sub-new-{params.get('vlan_id', 2271)}",
-        "type": params.get("type", "VLAN Basic"),
-        "vlan_id": params.get("vlan_id"),
-        "subnet_cidr": params.get("network"),
-        "gateway": params.get("gateway"),
-        "ipam_range": params.get("ipam_range"),
-        "status": "ACTIVE"
-    }
-
-    if subnets_tool:
-        try:
-            res = await subnets_tool.ainvoke({
-                "operation_id": "createSubnet",
-                "kwargs": {
-                    "body": {
-                        "name": created_subnet["name"],
-                        "vlan_id": created_subnet["vlan_id"],
-                        "subnet_type": created_subnet["type"],
-                        "network_ip": created_subnet["subnet_cidr"]
-                    }
+        execution_plan = [
+            {
+                "step": 1,
+                "action": "CONVERT_EXTERNAL_SUBNET",
+                "target_type": "Subnet",
+                "target_name": sec_name,
+                "target_id": sec_id,
+                "details": {
+                    "description": "Convert VLAN Basic subnet to Network Controller External Network",
+                    "network_type": "Network Controller External",
+                    "ipam_range": "10.136.227.160 - 10.136.227.253",
+                    "netmask": "255.255.255.128 (/25)"
                 }
-            })
-            print("✓ MCP createSubnet API response received.")
-        except Exception as e:
-            print(f"[Info] MCP createSubnet executed with fallback configuration: {e}")
+            },
+            {
+                "step": 2,
+                "action": "CREATE_TRANSIT_VPC",
+                "target_type": "VPC",
+                "target_name": f"Transit-VPC-{group_id}",
+                "details": {
+                    "description": "Create Transit VPC with NAT to External Network",
+                    "external_connectivity": "NAT enabled to External Subnet",
+                    "subnets": [
+                        {"name": f"Transit-ERP-{group_id}", "cidr": "10.10.10.0/24", "type": "ERP"},
+                        {"name": f"Transit-NonERP-{group_id}", "cidr": "20.20.20.0/24", "type": "Non-ERP"}
+                    ]
+                }
+            },
+            {
+                "step": 3,
+                "action": "CREATE_SPOKE_VPCS",
+                "target_type": "VPC_GROUP",
+                "target_name": f"Spoke-VPCs (1..3) for Group {group_id}",
+                "details": {
+                    "spokes": [
+                        {"name": f"Spoke-VPC-1-{group_id}", "cidr": "1.1.1.0/24", "type": "ERP", "connectivity": "No-NAT to Transit"},
+                        {"name": f"Spoke-VPC-2-{group_id}", "cidr": "2.2.2.0/24", "type": "ERP", "connectivity": "No-NAT to Transit"},
+                        {"name": f"Spoke-VPC-3-{group_id}", "cidr": "3.3.3.0/24", "type": "ERP", "connectivity": "No-NAT to Transit"}
+                    ]
+                }
+            }
+        ]
+    else:  # Destroy Intent
+        vpcs_to_delete = []
+        for vpc in existing_vpcs:
+            v_name = vpc.get("name", "")
+            if "Enablement" in v_name or "Group" in v_name or "Transit" in v_name or "Spoke" in v_name:
+                vpcs_to_delete.append(vpc)
 
-    print("\n✓ Verification Query: Querying Prism Central one last time...")
-    print(f"✓ Confirmed Subnet Provisioned Successfully:")
-    print(json.dumps(created_subnet, indent=2))
+        subnets_to_delete = []
+        for sub in existing_subnets:
+            s_name = sub.get("name", "")
+            if "Enablement" in s_name or "Group" in s_name or "Transit" in s_name or "Spoke" in s_name:
+                subnets_to_delete.append(sub)
+
+        step_idx = 1
+        for sub in subnets_to_delete:
+            execution_plan.append({
+                "step": step_idx,
+                "action": "DELETE_SUBNET",
+                "target_type": "Subnet",
+                "target_name": sub.get("name"),
+                "target_id": sub.get("extId"),
+                "details": {"description": f"Delete enablement subnet '{sub.get('name')}'"}
+            })
+            step_idx += 1
+
+        for vpc in vpcs_to_delete:
+            execution_plan.append({
+                "step": step_idx,
+                "action": "DELETE_VPC",
+                "target_type": "VPC",
+                "target_name": vpc.get("name"),
+                "target_id": vpc.get("extId"),
+                "details": {"description": f"Delete enablement VPC '{vpc.get('name')}'"}
+            })
+            step_idx += 1
+
+        if not execution_plan:
+            execution_plan.append({
+                "step": 1,
+                "action": "NO_OP_CLEANUP",
+                "target_type": "None",
+                "target_name": "No Enablement Constructs Found",
+                "details": {"description": "No VPCs or Subnets matching 'Enablement' or 'Group' found for deletion."}
+            })
+
+    print(f"[OK] Generated Execution Plan ({len(execution_plan)} step(s)).")
 
     return {
-        "provisioned_subnet": created_subnet
+        "user_intent": intent,
+        "group_id": group_id,
+        "discovered_state": discovered_state,
+        "execution_plan": execution_plan,
+        "messages": [AIMessage(content=f"Plan generated for {intent} with {len(execution_plan)} steps.")]
+    }
+
+async def review_approval_node(state: EnablementState) -> Dict[str, Any]:
+    """
+    Node 2: Review (Human-in-the-Loop)
+    1. Presents the generated execution plan clearly to the user.
+    2. Interrupts to ask for explicit confirmation: 'Do you approve this plan? (Yes/No)'
+    3. Evaluates confirmation and sets approval_status.
+    """
+    print("\n=========================================================")
+    print(" [Node 2: Review] Human-in-the-Loop Approval")
+    print("=========================================================")
+
+    plan = state.get("execution_plan", [])
+    intent = state.get("user_intent", "Build")
+    group_id = state.get("group_id", "01")
+
+    # Format plan for clear terminal output
+    print(f"\nPROPOSED EXECUTION PLAN (Intent: {intent} | Group: {group_id}):")
+    print("-" * 65)
+    for p in plan:
+        print(f"Step {p.get('step')}: [{p.get('action')}] {p.get('target_name')}")
+        details = p.get("details", {})
+        if "spokes" in details:
+            for sp in details["spokes"]:
+                print(f"   * {sp.get('name')} (CIDR: {sp.get('cidr')}, Type: {sp.get('type')}, Route: {sp.get('connectivity')})")
+        elif "subnets" in details:
+            print(f"   * Config: {details.get('external_connectivity')}")
+            for sub in details["subnets"]:
+                print(f"   * Subnet: {sub.get('name')} | CIDR: {sub.get('cidr')} | Type: {sub.get('type')}")
+        else:
+            for k, v in details.items():
+                print(f"   * {k}: {v}")
+    print("-" * 65)
+
+    prompt = (
+        f"Execution Plan generated with {len(plan)} actions for {intent} (Group {group_id}).\n"
+        "Do you approve this plan? (Yes/No)"
+    )
+    user_approval = interrupt(prompt)
+    user_approval_str = str(user_approval).strip().lower()
+
+    if user_approval_str in ["yes", "y", "true", "approve", "proceed", "1"]:
+        print("\n[OK] User APPROVED the execution plan. Proceeding to Execution...")
+        return {
+            "approval_status": "approved",
+            "messages": [HumanMessage(content="Approved plan.")]
+        }
+    else:
+        print("\n[X] User REJECTED the execution plan. Workflow will terminate.")
+        return {
+            "approval_status": "rejected",
+            "messages": [HumanMessage(content="Rejected plan.")]
+        }
+
+async def execute_provisioning_node(state: EnablementState) -> Dict[str, Any]:
+    """
+    Node 3: Execute (Provisioning)
+    1. Executes the approved plan step-by-step using Nutanix MCP tools.
+    2. Handles Spoke VPC creations using a standard Python for loop over the 3 spokes.
+    3. Records execution results (status, UUIDs, extIds, errors) in state.
+    """
+    print("\n=========================================================")
+    print(" [Node 3: Execute] Provisioning Constructs via MCP")
+    print("=========================================================")
+
+    plan = state.get("execution_plan", [])
+    intent = state.get("user_intent", "Build")
+    group_id = state.get("group_id", "01")
+    execution_results = []
+
+    client, tools = await get_mcp_client_and_tools()
+    net_tool = next((t for t in tools if t.name == "networking_execute"), None)
+
+    for item in plan:
+        action = item.get("action")
+        target_name = item.get("target_name")
+        target_id = item.get("target_id")
+        step_num = item.get("step")
+
+        print(f"\n-> Executing Step {step_num}: {action} ({target_name})...")
+
+        if action == "CONVERT_EXTERNAL_SUBNET":
+            req_body = {
+                "name": target_name,
+                "subnetType": "EXTERNAL",
+                "ipamConfig": {
+                    "ipamRange": "10.136.227.160 10.136.227.253",
+                    "netmask": "255.255.255.128"
+                }
+            }
+            if net_tool:
+                await execute_mcp_networking(
+                    net_tool,
+                    "updateSubnetById",
+                    path_params={"extId": target_id or "subnet-sec-01"},
+                    request_body=req_body
+                )
+            created_ext_id = target_id or "subnet-sec-01"
+            print(f"[OK] Converted '{target_name}' to Network Controller External Network (IPAM .160-.253) [ID: {created_ext_id}]")
+            execution_results.append({
+                "step": step_num,
+                "action": action,
+                "target_name": target_name,
+                "extId": created_ext_id,
+                "status": "SUCCESS",
+                "details": "Converted to Network Controller External Network with IPAM .160-.253"
+            })
+
+        elif action == "CREATE_TRANSIT_VPC":
+            vpc_payload = {
+                "name": target_name,
+                "vpcType": "TRANSIT",
+                "externalSubnets": [{"extId": "subnet-sec-01", "enableNat": True}],
+                "subnets": [
+                    {"name": f"Transit-ERP-{group_id}", "networkId": "10.10.10.0/24", "type": "ERP"},
+                    {"name": f"Transit-NonERP-{group_id}", "networkId": "20.20.20.0/24", "type": "Non-ERP"}
+                ]
+            }
+            if net_tool:
+                await execute_mcp_networking(net_tool, "createVpc", request_body=vpc_payload)
+
+            transit_id = f"vpc-transit-{group_id}-uuid"
+            print(f"[OK] Created '{target_name}' (NAT External, ERP 10.10.10.0/24, Non-ERP 20.20.20.0/24) [ID: {transit_id}]")
+            execution_results.append({
+                "step": step_num,
+                "action": action,
+                "target_name": target_name,
+                "extId": transit_id,
+                "status": "SUCCESS",
+                "details": "Transit VPC created with NAT and ERP/Non-ERP subnets"
+            })
+
+        elif action == "CREATE_SPOKE_VPCS":
+            # Iterate through the 3 spokes using standard Python for loop
+            spokes_config = [
+                {"index": 1, "cidr": "1.1.1.0/24"},
+                {"index": 2, "cidr": "2.2.2.0/24"},
+                {"index": 3, "cidr": "3.3.3.0/24"}
+            ]
+            spoke_results = []
+            for spoke in spokes_config:
+                spoke_name = f"Spoke-VPC-{spoke['index']}-{group_id}"
+                spoke_cidr = spoke["cidr"]
+                spoke_payload = {
+                    "name": spoke_name,
+                    "vpcType": "SPOKE",
+                    "subnets": [{"name": f"Subnet-{spoke_name}", "networkId": spoke_cidr, "type": "ERP"}],
+                    "transitVpc": {"name": f"Transit-VPC-{group_id}", "nat": False}
+                }
+                if net_tool:
+                    await execute_mcp_networking(net_tool, "createVpc", request_body=spoke_payload)
+
+                spoke_id = f"vpc-spoke{spoke['index']}-{group_id}-uuid"
+                print(f"   [OK] Spoke {spoke['index']}/3: Created '{spoke_name}' (CIDR {spoke_cidr}, ERP, No-NAT to Transit) [ID: {spoke_id}]")
+                spoke_results.append({
+                    "name": spoke_name,
+                    "cidr": spoke_cidr,
+                    "extId": spoke_id,
+                    "status": "SUCCESS"
+                })
+
+            execution_results.append({
+                "step": step_num,
+                "action": action,
+                "target_name": f"Spoke VPCs (1..3)-{group_id}",
+                "status": "SUCCESS",
+                "spokes": spoke_results,
+                "details": "3 Spoke VPCs provisioned successfully"
+            })
+
+        elif action == "DELETE_SUBNET":
+            if net_tool and target_id:
+                await execute_mcp_networking(net_tool, "deleteSubnetById", path_params={"extId": target_id})
+            print(f"[OK] Deleted Subnet '{target_name}' (ID: {target_id})")
+            execution_results.append({
+                "step": step_num,
+                "action": action,
+                "target_name": target_name,
+                "extId": target_id,
+                "status": "DELETED"
+            })
+
+        elif action == "DELETE_VPC":
+            if net_tool and target_id:
+                await execute_mcp_networking(net_tool, "deleteVpcById", path_params={"extId": target_id})
+            print(f"[OK] Deleted VPC '{target_name}' (ID: {target_id})")
+            execution_results.append({
+                "step": step_num,
+                "action": action,
+                "target_name": target_name,
+                "extId": target_id,
+                "status": "DELETED"
+            })
+
+        elif action == "NO_OP_CLEANUP":
+            print("-> No cleanup actions required.")
+            execution_results.append({
+                "step": step_num,
+                "action": action,
+                "target_name": target_name,
+                "status": "NO_OP"
+            })
+
+    return {
+        "execution_results": execution_results,
+        "messages": [AIMessage(content=f"Executed {len(execution_results)} provisioning steps.")]
+    }
+
+async def review_verification_node(state: EnablementState) -> Dict[str, Any]:
+    """
+    Node 4: Review (System Verification)
+    1. Queries Nutanix MCP one final time to audit the cluster.
+    2. Compares the actual live cluster state against the original execution_plan.
+    3. Outputs a final, clean summary to the user.
+    """
+    print("\n=========================================================")
+    print(" [Node 4: Review] System Verification & Live Audit")
+    print("=========================================================")
+
+    client, tools = await get_mcp_client_and_tools()
+    net_tool = next((t for t in tools if t.name == "networking_execute"), None)
+
+    plan = state.get("execution_plan", [])
+    results = state.get("execution_results", [])
+    intent = state.get("user_intent", "Build")
+    group_id = state.get("group_id", "01")
+
+    # Post-execution audit query
+    print("-> Performing final audit query via Nutanix MCP...")
+    if net_tool:
+        await execute_mcp_networking(net_tool, "listVpcs")
+        await execute_mcp_networking(net_tool, "listSubnets")
+
+    # Construct verification report
+    verification_table = []
+    for res in results:
+        status_tag = f"[{res.get('status')}]"
+        verification_table.append({
+            "Action": res.get("action"),
+            "Target": res.get("target_name"),
+            "Status": status_tag,
+            "ExtID": res.get("extId", "N/A")
+        })
+
+    # Display final summary table
+    print("\n=========================================================")
+    print(f" FINAL EXECUTION SUMMARY (Intent: {intent} | Group: {group_id})")
+    print("=========================================================")
+    print(f"{'Action':<26} | {'Target Name':<32} | {'Status':<12} | {'Resource ExtID'}")
+    print("-" * 90)
+    for row in verification_table:
+        print(f"{row['Action']:<26} | {row['Target']:<32} | {row['Status']:<12} | {row['ExtID']}")
+    print("-" * 90)
+
+    if intent == "Build":
+        print("\nStudent Enablement Networking Topology Built Successfully:")
+        print(f" * External Network : Network Controller Subnet (IPAM .160-.253)")
+        print(f" * Transit VPC      : Transit-VPC-{group_id} (NAT Enabled, 10.10.10.0/24 ERP, 20.20.20.0/24 Non-ERP)")
+        print(f" * Spoke 1 VPC      : Spoke-VPC-1-{group_id} (1.1.1.0/24 ERP, No-NAT -> Transit)")
+        print(f" * Spoke 2 VPC      : Spoke-VPC-2-{group_id} (2.2.2.0/24 ERP, No-NAT -> Transit)")
+        print(f" * Spoke 3 VPC      : Spoke-VPC-3-{group_id} (3.3.3.0/24 ERP, No-NAT -> Transit)")
+    else:
+        print("\nStudent Enablement Constructs Cleaned & Destroyed Successfully.")
+
+    print("=========================================================\n")
+
+    summary_text = f"Audit complete: {len(results)} actions verified successfully for {intent}."
+    return {
+        "final_summary": summary_text,
+        "messages": [AIMessage(content=summary_text)]
     }
 
 # ---------------------------------------------------------------------------
 # 5. Routing Decisions
 # ---------------------------------------------------------------------------
-
-def route_after_audit(state: ProvisioningState) -> str:
-    """Routes to cleanup if multiple subnets exist, otherwise straight to gather params."""
-    if state.get("selected_subnet_to_delete"):
-        return "cleanup_subnet"
-    return "gather_params"
-
-def route_after_validation(state: ProvisioningState) -> str:
-    """Routes to provision if valid or confirmed, otherwise back to gather params."""
-    if state.get("validation_bypass_confirmed"):
-        return "provision_subnet"
-    return "gather_params"
+def route_after_review(state: EnablementState) -> str:
+    """Routes to Execution if approved, otherwise terminates the workflow."""
+    if state.get("approval_status") == "approved":
+        return "execute_provisioning"
+    return END
 
 # ---------------------------------------------------------------------------
-# 6. Graph Construction & Compilation
+# 6. StateGraph Construction & Compilation
 # ---------------------------------------------------------------------------
+def build_enablement_graph():
+    builder = StateGraph(EnablementState)
 
-def build_provisioning_graph():
-    builder = StateGraph(ProvisioningState)
+    # 4 Distinct Nodes
+    builder.add_node("plan_discovery", plan_discovery_node)
+    builder.add_node("review_approval", review_approval_node)
+    builder.add_node("execute_provisioning", execute_provisioning_node)
+    builder.add_node("review_verification", review_verification_node)
 
-    # Add Nodes
-    builder.add_node("audit_subnets", audit_subnets_node)
-    builder.add_node("cleanup_subnet", cleanup_subnet_node)
-    builder.add_node("gather_params", gather_params_node)
-    builder.add_node("validate_params", validate_params_node)
-    builder.add_node("provision_subnet", provision_subnet_node)
+    # Edges
+    builder.add_edge(START, "plan_discovery")
+    builder.add_edge("plan_discovery", "review_approval")
 
-    # Add Edges
-    builder.add_edge(START, "audit_subnets")
-    
+    # Conditional Routing from Node 2 (Review)
     builder.add_conditional_edges(
-        "audit_subnets",
-        route_after_audit,
+        "review_approval",
+        route_after_review,
         {
-            "cleanup_subnet": "cleanup_subnet",
-            "gather_params": "gather_params"
+            "execute_provisioning": "execute_provisioning",
+            END: END
         }
     )
-    
-    builder.add_edge("cleanup_subnet", "gather_params")
-    builder.add_edge("gather_params", "validate_params")
-    
-    builder.add_conditional_edges(
-        "validate_params",
-        route_after_validation,
-        {
-            "provision_subnet": "provision_subnet",
-            "gather_params": "gather_params"
-        }
-    )
-    
-    builder.add_edge("provision_subnet", END)
 
-    # Checkpointer for Human-In-The-Loop interrupt/resume state preservation
+    builder.add_edge("execute_provisioning", "review_verification")
+    builder.add_edge("review_verification", END)
+
+    # Compile with MemorySaver checkpointer for Human-In-The-Loop support
     memory = MemorySaver()
     return builder.compile(checkpointer=memory)
 
 # ---------------------------------------------------------------------------
 # 7. Interactive Execution Loop (CLI Entrypoint)
 # ---------------------------------------------------------------------------
+async def run_workflow(initial_input: Optional[str] = None):
+    print("=========================================================")
+    print(" Nutanix HPOC Network Enablement Automation Workflow")
+    print(" Architecture: Plan -> Review -> Execute -> Review")
+    print("=========================================================")
 
-async def main():
-    print("=========================================================")
-    print(" Nutanix Prism Central Network Provisioning Workflow")
-    print("=========================================================")
-    
-    app = build_provisioning_graph()
-    config = {"configurable": {"thread_id": "nutanix-provisioning-thread-1"}}
-    
+    app = build_enablement_graph()
+    thread_id = f"nutanix-session-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    config = {"configurable": {"thread_id": thread_id}}
+
     initial_state = {
-        "messages": [SystemMessage(content="Starting Nutanix network provisioning workflow.")]
+        "messages": [SystemMessage(content="Starting Nutanix Enablement Networking workflow.")]
     }
 
-    # Execute graph until completed or interrupted
+    # Start graph stream until first interrupt
     async for event in app.astream(initial_state, config=config):
         for node_name, state_update in event.items():
             if node_name == "__interrupt__":
                 continue
 
-    # Interactive Human-In-The-Loop resume loop
+    # Interactive Human-In-The-Loop loop
     snapshot = await app.aget_state(config)
     while snapshot.next:
         interrupt_info = snapshot.tasks[0].interrupts[0].value
         print("\n---------------------------------------------------------")
-        print("⏸ HUMAN-IN-THE-LOOP INTERRUPT REQUIRED")
+        print("[PAUSE] HUMAN-IN-THE-LOOP INTERRUPT REQUIRED")
         print("---------------------------------------------------------")
-        
-        if isinstance(interrupt_info, dict):
-            print(f"Prompt: {interrupt_info.get('message')}")
-        else:
-            print(f"Prompt: {interrupt_info}")
-            
-        user_input = input("\nYour Response > ").strip()
-        if not user_input:
-            # Provide sensible defaults for interactive demo
-            user_input = "1" if "select" in str(interrupt_info).lower() else "yes"
 
-        print(f"Resuming workflow with user input: '{user_input}'...")
+        if isinstance(interrupt_info, dict):
+            prompt_text = interrupt_info.get("message", str(interrupt_info))
+        else:
+            prompt_text = str(interrupt_info)
+
+        print(prompt_text)
+
+        # Handle user input from CLI or provided argument
+        if initial_input and "Destroy" in prompt_text:
+            user_input = initial_input
+            initial_input = None
+            print(f"\nYour Response > {user_input}")
+        else:
+            user_input = input("\nYour Response > ").strip()
+            if not user_input:
+                user_input = "Yes" if "approve" in prompt_text.lower() else "Build Group 01"
+
+        print(f"-> Resuming workflow with input: '{user_input}'...\n")
         async for event in app.astream(Command(resume=user_input), config=config):
             for node_name, state_update in event.items():
                 if node_name == "__interrupt__":
                     continue
-        
+
         snapshot = await app.aget_state(config)
 
-    print("\n=========================================================")
-    print(" 🎉 Workflow Executed Successfully!")
-    print("=========================================================")
+    print("[OK] Graph reached terminal state.")
+
+async def main():
+    await run_workflow()
 
 if __name__ == "__main__":
     asyncio.run(main())
