@@ -66,6 +66,7 @@ class EnablementState(TypedDict, total=False):
     group_id: Optional[str]                 # e.g., "01", "02"
     discovered_state: Dict[str, Any]        # Cluster snapshot (VPCs, Subnets)
     captured_vlan_info: Dict[str, Any]      # Extracted VLAN ID, Cluster Ref, Subnet Name prior to deletion
+    captured_dns_servers: List[str]         # Extracted Cluster DNS / Name Server IPs
     execution_plan: List[Dict[str, Any]]    # Generated list of planned actions
     approval_status: Optional[str]          # "approved" or "rejected"
     execution_results: List[Dict[str, Any]] # Outcome logs & UUIDs per executed action
@@ -120,6 +121,54 @@ class NutanixPrismClient:
             time.sleep(2)
         return None
 
+    def list_clusters(self) -> List[Dict[str, Any]]:
+        for v in ["v4.0", "v4.0.b1", "v4.1"]:
+            try:
+                res = self.client.get(f"{self.base_url}/api/clustermgmt/{v}/config/clusters")
+                if res.status_code == 200:
+                    return res.json().get("data", [])
+            except Exception:
+                pass
+        return []
+
+    def get_cluster(self, cluster_id: str) -> Optional[Dict[str, Any]]:
+        for v in ["v4.0", "v4.0.b1", "v4.1"]:
+            try:
+                res = self.client.get(f"{self.base_url}/api/clustermgmt/{v}/config/clusters/{cluster_id}")
+                if res.status_code == 200:
+                    return res.json().get("data")
+            except Exception:
+                pass
+        return None
+
+    def get_cluster_dns_servers(self, preferred_cluster_id: Optional[str] = None) -> List[str]:
+        """Discovers and extracts configured DNS/Name Server IPs from the target Nutanix cluster."""
+        dns_servers: List[str] = []
+        if preferred_cluster_id:
+            cl = self.get_cluster(preferred_cluster_id)
+            if cl:
+                for ns in cl.get("network", {}).get("nameServerIpList", []):
+                    ip_val = ns.get("ipv4", {}).get("value") or ns.get("value")
+                    if ip_val and ip_val != "127.0.0.1" and ip_val not in dns_servers:
+                        dns_servers.append(ip_val)
+
+        if not dns_servers:
+            clusters = self.list_clusters()
+            sorted_clusters = sorted(clusters, key=lambda c: 0 if c.get("clusterType") == "HYPER_CONVERGED" else 1)
+            for c_summary in sorted_clusters:
+                c_id = c_summary.get("extId")
+                if not c_id:
+                    continue
+                cl = self.get_cluster(c_id)
+                if cl:
+                    for ns in cl.get("network", {}).get("nameServerIpList", []):
+                        ip_val = ns.get("ipv4", {}).get("value") or ns.get("value")
+                        if ip_val and ip_val != "127.0.0.1" and ip_val not in dns_servers:
+                            dns_servers.append(ip_val)
+                if dns_servers:
+                    break
+        return dns_servers
+
     def list_subnets(self) -> List[Dict[str, Any]]:
         for v in ["v4.0", "v4.0.b1", "v4.1"]:
             try:
@@ -141,6 +190,15 @@ class NutanixPrismClient:
         return None
 
     def delete_subnet(self, subnet_id: str) -> bool:
+        # Detach/clean up any VPCs referencing this subnet as external subnet
+        for vpc in self.list_vpcs():
+            ext_subs = vpc.get("externalSubnets", [])
+            for es in ext_subs:
+                if es.get("subnetReference") == subnet_id:
+                    print(f"-> Detaching referencing VPC '{vpc.get('name')}' ({vpc.get('extId')}) before subnet deletion...")
+                    self.delete_vpc(vpc.get("extId"))
+                    time.sleep(2)
+
         for v in ["v4.0", "v4.0.b1", "v4.1"]:
             try:
                 res = self.client.delete(
@@ -151,7 +209,8 @@ class NutanixPrismClient:
                     if res.status_code == 202:
                         task_id = res.json().get("data", {}).get("extId")
                         if task_id:
-                            self.poll_task(task_id)
+                            task_res = self.poll_task(task_id)
+                            return task_res is not None
                     return True
             except Exception as e:
                 print(f"[Error] Delete Subnet {subnet_id}: {e}")
@@ -331,6 +390,11 @@ async def plan_discovery_node(state: EnablementState) -> Dict[str, Any]:
     if captured_vlan_id is None:
         captured_vlan_id = 2271
 
+    # 3. Capture Cluster Configured DNS / Name Servers
+    captured_dns_servers = pc.get_cluster_dns_servers(captured_cluster_ref)
+    if not captured_dns_servers:
+        captured_dns_servers = ["10.42.194.10"]
+
     captured_vlan_info = {
         "vlan_id": int(captured_vlan_id),
         "cluster_ref": captured_cluster_ref,
@@ -342,14 +406,16 @@ async def plan_discovery_node(state: EnablementState) -> Dict[str, Any]:
     discovered_state = {
         "existing_vpcs": existing_vpcs,
         "existing_subnets": existing_subnets,
-        "secondary_subnet": secondary_subnet
+        "secondary_subnet": secondary_subnet,
+        "dns_servers": captured_dns_servers
     }
 
     print(f"-> Discovered {len(existing_vpcs)} live VPC(s) and {len(existing_subnets)} subnet(s) on cluster.")
     print(f"-> Target Subnet Identified: '{sec_name}' (ID: {sec_id or 'Auto-Detect'})")
     print(f"-> [CAPTURE] VLAN ID captured: {captured_vlan_id} | Cluster: {captured_cluster_ref}")
+    print(f"-> [CAPTURE] Cluster DNS Server(s) captured: {captured_dns_servers}")
 
-    # 3. Generate Execution Plan
+    # 4. Generate Execution Plan
     execution_plan = []
     if intent == "Build":
         execution_plan = [
@@ -386,7 +452,8 @@ async def plan_discovery_node(state: EnablementState) -> Dict[str, Any]:
                 "target_type": "VPC",
                 "target_name": f"Transit-VPC-{group_id}",
                 "details": {
-                    "description": "Create Transit VPC attached to External Subnet with NAT enabled and ERP advertisement",
+                    "description": "Create Transit VPC attached to External Subnet with NAT enabled, ERP advertisement, and cluster DNS",
+                    "dns_servers": captured_dns_servers,
                     "external_connectivity": f"NAT enabled to External Subnet ({sec_name})",
                     "subnets": [
                         {
@@ -412,6 +479,7 @@ async def plan_discovery_node(state: EnablementState) -> Dict[str, Any]:
                 "target_type": "VPC_GROUP",
                 "target_name": f"Spoke-VPCs (1..3) for Group {group_id}",
                 "details": {
+                    "dns_servers": captured_dns_servers,
                     "spokes": [
                         {
                             "name": f"Spoke-VPC-1-{group_id}",
@@ -493,6 +561,7 @@ async def plan_discovery_node(state: EnablementState) -> Dict[str, Any]:
         "group_id": group_id,
         "discovered_state": discovered_state,
         "captured_vlan_info": captured_vlan_info,
+        "captured_dns_servers": captured_dns_servers,
         "execution_plan": execution_plan,
         "messages": [AIMessage(content=f"Plan generated for {intent} with {len(execution_plan)} steps.")]
     }
@@ -507,6 +576,7 @@ async def review_approval_node(state: EnablementState) -> Dict[str, Any]:
     intent = state.get("user_intent", "Build")
     group_id = state.get("group_id", "01")
     captured_info = state.get("captured_vlan_info", {})
+    captured_dns = state.get("captured_dns_servers", [])
 
     print(f"\nPROPOSED EXECUTION PLAN (Intent: {intent} | Group: {group_id}):")
     print("-" * 75)
@@ -514,9 +584,13 @@ async def review_approval_node(state: EnablementState) -> Dict[str, Any]:
         print(f"Step {p.get('step')}: [{p.get('action')}] {p.get('target_name')}")
         details = p.get("details", {})
         if "spokes" in details:
+            if "dns_servers" in details:
+                print(f"   * DNS Server(s): {', '.join(details.get('dns_servers', []))}")
             for sp in details["spokes"]:
                 print(f"   * {sp.get('name')} (CIDR: {sp.get('cidr')}, Type: {sp.get('type')}, Route: {sp.get('connectivity')})")
         elif "subnets" in details:
+            if "dns_servers" in details:
+                print(f"   * DNS Server(s): {', '.join(details.get('dns_servers', []))}")
             print(f"   * Config: {details.get('external_connectivity')}")
             for sub in details["subnets"]:
                 print(f"   * Subnet: {sub.get('name')} | CIDR: {sub.get('cidr')} | Type: {sub.get('type')}")
@@ -525,8 +599,11 @@ async def review_approval_node(state: EnablementState) -> Dict[str, Any]:
                 print(f"   * {k}: {v}")
     print("-" * 75)
 
-    if intent == "Build" and captured_info.get("vlan_id"):
-        print(f"[CONFIRMATION] Captured VLAN ID to reuse: {captured_info.get('vlan_id')}")
+    if intent == "Build":
+        if captured_info.get("vlan_id"):
+            print(f"[CONFIRMATION] Captured VLAN ID to reuse: {captured_info.get('vlan_id')}")
+        if captured_dns:
+            print(f"[CONFIRMATION] Captured Cluster DNS Server(s) to configure: {', '.join(captured_dns)}")
 
     prompt = (
         f"Execution Plan generated with {len(plan)} actions for {intent} (Group {group_id}).\n"
@@ -558,6 +635,7 @@ async def execute_provisioning_node(state: EnablementState) -> Dict[str, Any]:
     intent = state.get("user_intent", "Build")
     group_id = state.get("group_id", "01")
     captured_info = state.get("captured_vlan_info", {})
+    captured_dns_servers = state.get("captured_dns_servers", [])
     vlan_id = captured_info.get("vlan_id", 2271)
     cluster_ref = captured_info.get("cluster_ref")
     vswitch_ref = captured_info.get("vswitch_ref")
@@ -629,16 +707,19 @@ async def execute_provisioning_node(state: EnablementState) -> Dict[str, Any]:
                 subnet_body["virtualSwitchReference"] = vswitch_ref
 
             created_external_subnet_ext_id = pc.create_subnet(subnet_body)
+            if not created_external_subnet_ext_id:
+                # If already existing external subnet on cluster, reuse it
+                created_external_subnet_ext_id = captured_info.get("subnet_ext_id")
 
             if created_external_subnet_ext_id:
-                print(f"[OK] Created External VLAN Subnet '{target_name}' using VLAN {vlan_id} [ID: {created_external_subnet_ext_id}]")
+                print(f"[OK] External VLAN Subnet '{target_name}' ready with VLAN {vlan_id} [ID: {created_external_subnet_ext_id}]")
                 execution_results.append({
                     "step": step_num,
                     "action": action,
                     "target_name": target_name,
                     "extId": created_external_subnet_ext_id,
                     "status": "SUCCESS",
-                    "details": f"Created External VLAN Subnet with VLAN ID {vlan_id} (IPAM .160-.253)"
+                    "details": f"External VLAN Subnet with VLAN ID {vlan_id} (IPAM .160-.253)"
                 })
             else:
                 print(f"[Error] Failed to create External VLAN Subnet '{target_name}'.")
@@ -670,15 +751,25 @@ async def execute_provisioning_node(state: EnablementState) -> Dict[str, Any]:
                     {"ipv4": {"ip": {"value": "3.3.3.0", "prefixLength": 32}, "prefixLength": 24}}
                 ]
             }
-            if created_external_subnet_ext_id:
+            if captured_dns_servers:
+                vpc_body["commonDhcpOptions"] = {
+                    "domainNameServers": [
+                        {"ipv4": {"value": dns_ip, "prefixLength": 32}}
+                        for dns_ip in captured_dns_servers
+                    ]
+                }
+            
+            ext_sub_ref = created_external_subnet_ext_id or captured_info.get("subnet_ext_id")
+            if ext_sub_ref:
                 vpc_body["externalSubnets"] = [
-                    {"subnetReference": created_external_subnet_ext_id}
+                    {"subnetReference": ext_sub_ref}
                 ]
 
             created_transit_vpc_ext_id = pc.create_vpc(vpc_body)
 
             if created_transit_vpc_ext_id:
-                print(f"[OK] Created Transit VPC '{target_name}' with ERP Advertisements [ID: {created_transit_vpc_ext_id}]")
+                dns_str = f" with DNS {captured_dns_servers}" if captured_dns_servers else ""
+                print(f"[OK] Created Transit VPC '{target_name}'{dns_str} & ERP Advertisements [ID: {created_transit_vpc_ext_id}]")
 
                 # Create ERP and Non-ERP overlay subnets with full IPAM
                 erp_sub = {
@@ -718,7 +809,7 @@ async def execute_provisioning_node(state: EnablementState) -> Dict[str, Any]:
                     "target_name": target_name,
                     "extId": created_transit_vpc_ext_id,
                     "status": "SUCCESS",
-                    "details": "Transit VPC created with NAT, ERP/Non-ERP subnets and IPAM pools (.160-.253)"
+                    "details": f"Transit VPC created with DNS {captured_dns_servers}, NAT, ERP/Non-ERP subnets and IPAM pools (.160-.253)"
                 })
             else:
                 print(f"[Error] Failed to create Transit VPC '{target_name}'.")
@@ -761,6 +852,13 @@ async def execute_provisioning_node(state: EnablementState) -> Dict[str, Any]:
                         }
                     ]
                 }
+                if captured_dns_servers:
+                    spoke_body["commonDhcpOptions"] = {
+                        "domainNameServers": [
+                            {"ipv4": {"value": dns_ip, "prefixLength": 32}}
+                            for dns_ip in captured_dns_servers
+                        ]
+                    }
                 spoke_id = pc.create_vpc(spoke_body)
                 if spoke_id:
                     # Create overlay ERP subnet in Spoke VPC with full IPAM
@@ -784,7 +882,7 @@ async def execute_provisioning_node(state: EnablementState) -> Dict[str, Any]:
                         ]
                     }
                     pc.create_subnet(spoke_sub)
-                    print(f"   [OK] Spoke {spoke['index']}/3: Created '{spoke_name}' (ERP {spoke['ip']}/24, GW {spoke['gw']}, IPAM {spoke['pool_start']}-{spoke['pool_end']}) [ID: {spoke_id}]")
+                    print(f"   [OK] Spoke {spoke['index']}/3: Created '{spoke_name}' (DNS {captured_dns_servers}, ERP {spoke['ip']}/24, GW {spoke['gw']}, IPAM {spoke['pool_start']}-{spoke['pool_end']}) [ID: {spoke_id}]")
                     spoke_results.append({"name": spoke_name, "extId": spoke_id, "status": "SUCCESS"})
                 else:
                     print(f"   [Error] Failed to create Spoke VPC '{spoke_name}'")
@@ -796,7 +894,7 @@ async def execute_provisioning_node(state: EnablementState) -> Dict[str, Any]:
                 "target_name": f"Spoke VPCs (1..3)-{group_id}",
                 "status": "SUCCESS" if all(s["status"] == "SUCCESS" for s in spoke_results) else "PARTIAL",
                 "spokes": spoke_results,
-                "details": "3 Spoke VPCs provisioned with ERP designations and full IPAM pools (.160-.253)"
+                "details": f"3 Spoke VPCs provisioned with DNS {captured_dns_servers}, ERP designations and full IPAM pools (.160-.253)"
             })
 
         elif action == "DELETE_VPC":
@@ -845,6 +943,7 @@ async def review_verification_node(state: EnablementState) -> Dict[str, Any]:
     intent = state.get("user_intent", "Build")
     group_id = state.get("group_id", "01")
     captured_info = state.get("captured_vlan_info", {})
+    captured_dns_servers = state.get("captured_dns_servers", [])
     vlan_id = captured_info.get("vlan_id", 2271)
 
     pc = NutanixPrismClient()
@@ -873,15 +972,17 @@ async def review_verification_node(state: EnablementState) -> Dict[str, Any]:
     print("-" * 90)
 
     if intent == "Build":
+        dns_display = ", ".join(captured_dns_servers) if captured_dns_servers else "None"
         print("\nStudent Enablement Networking Topology Provisioned:")
-        print(f" * Reused VLAN ID  : {vlan_id}")
-        print(f" * External Network: Network Controller Subnet (IPAM .160-.253 on /25)")
-        print(f" * Transit VPC     : Transit-VPC-{group_id} (NAT Enabled, ERP Advertised)")
+        print(f" * Reused VLAN ID     : {vlan_id}")
+        print(f" * Cluster DNS Server : {dns_display} (Configured on all VPCs)")
+        print(f" * External Network   : Network Controller Subnet (IPAM .160-.253 on /25)")
+        print(f" * Transit VPC        : Transit-VPC-{group_id} (DNS: {dns_display}, NAT Enabled, ERP Advertised)")
         print(f"   - Transit-ERP-{group_id}    : 10.10.10.0/24 (GW 10.10.10.1, IPAM .160-.253, ERP)")
         print(f"   - Transit-NonERP-{group_id} : 20.20.20.0/24 (GW 20.20.20.1, IPAM .160-.253, Non-ERP)")
-        print(f" * Spoke 1 VPC     : Spoke-VPC-1-{group_id} (ERP 1.1.1.0/24, GW 1.1.1.1, IPAM .160-.253, No-NAT -> Transit)")
-        print(f" * Spoke 2 VPC     : Spoke-VPC-2-{group_id} (ERP 2.2.2.0/24, GW 2.2.2.1, IPAM .160-.253, No-NAT -> Transit)")
-        print(f" * Spoke 3 VPC     : Spoke-VPC-3-{group_id} (ERP 3.3.3.0/24, GW 3.3.3.1, IPAM .160-.253, No-NAT -> Transit)")
+        print(f" * Spoke 1 VPC        : Spoke-VPC-1-{group_id} (DNS: {dns_display}, ERP 1.1.1.0/24, GW 1.1.1.1, IPAM .160-.253, No-NAT -> Transit)")
+        print(f" * Spoke 2 VPC        : Spoke-VPC-2-{group_id} (DNS: {dns_display}, ERP 2.2.2.0/24, GW 2.2.2.1, IPAM .160-.253, No-NAT -> Transit)")
+        print(f" * Spoke 3 VPC        : Spoke-VPC-3-{group_id} (DNS: {dns_display}, ERP 3.3.3.0/24, GW 3.3.3.1, IPAM .160-.253, No-NAT -> Transit)")
     else:
         print("\nStudent Enablement Constructs Cleaned & Destroyed Successfully.")
 
