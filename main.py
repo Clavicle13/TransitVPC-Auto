@@ -30,6 +30,15 @@ from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt, Command
 
+# LangSmith Imports & Decorator
+try:
+    from langsmith import traceable
+except ImportError:
+    def traceable(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+
 # ---------------------------------------------------------------------------
 # 1. Environment & Tracing Setup
 # ---------------------------------------------------------------------------
@@ -37,10 +46,43 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(SCRIPT_DIR, ".env")
 load_dotenv(ENV_FILE, override=True)
 
-if os.getenv("LANGCHAIN_API_KEY"):
-    os.environ["LANGCHAIN_TRACING_V2"] = os.getenv("LANGCHAIN_TRACING_V2", "true")
-    os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT", "nutanix-network-enablement")
-    print("[OK] LangSmith tracing is active.")
+# Synchronize LangSmith / LangChain Tracing Environment Variables
+langsmith_api_key = os.getenv("LANGSMITH_API_KEY") or os.getenv("LANGCHAIN_API_KEY")
+if langsmith_api_key:
+    os.environ["LANGSMITH_API_KEY"] = langsmith_api_key
+    os.environ["LANGCHAIN_API_KEY"] = langsmith_api_key
+
+    tracing_enabled = os.getenv("LANGSMITH_TRACING") or os.getenv("LANGCHAIN_TRACING_V2") or "true"
+    os.environ["LANGSMITH_TRACING"] = tracing_enabled
+    os.environ["LANGCHAIN_TRACING_V2"] = tracing_enabled
+
+    project = os.getenv("LANGSMITH_PROJECT") or os.getenv("LANGCHAIN_PROJECT") or "nutanix-network-enablement"
+    project = project.strip('"').strip("'")
+    os.environ["LANGSMITH_PROJECT"] = project
+    os.environ["LANGCHAIN_PROJECT"] = project
+
+    endpoint = os.getenv("LANGSMITH_ENDPOINT") or os.getenv("LANGCHAIN_ENDPOINT")
+    if endpoint:
+        endpoint = endpoint.strip('"').strip("'")
+        os.environ["LANGSMITH_ENDPOINT"] = endpoint
+        os.environ["LANGCHAIN_ENDPOINT"] = endpoint
+
+    # Handle SSL verification bypass if configured
+    ignore_certs = os.getenv("LANGSMITH_DANGEROUSLY_IGNORE_CERTS", "").lower() in ["true", "1", "yes"]
+    if ignore_certs:
+        os.environ["LANGSMITH_DANGEROUSLY_IGNORE_CERTS"] = "true"
+        import urllib3
+        import requests
+        urllib3.disable_warnings()
+        _orig_session_init = requests.Session.__init__
+        def _patched_session_init(self, *args, **kwargs):
+            _orig_session_init(self, *args, **kwargs)
+            self.verify = False
+        requests.Session.__init__ = _patched_session_init
+
+    print(f"[OK] LangSmith tracing is active (Project: '{project}').")
+else:
+    print("[Info] LangSmith API key not found; tracing is disabled.")
 
 def get_llm() -> Optional[ChatGoogleGenerativeAI]:
     """Initializes the Gemini LLM instance if API key is present."""
@@ -99,6 +141,7 @@ class NutanixPrismClient:
             "NTNX-Request-Id": str(uuid.uuid4())
         }
 
+    @traceable(name="Nutanix: Poll Task", run_type="tool")
     def poll_task(self, task_ext_id: str, timeout_sec: int = 60) -> Optional[str]:
         """Polls async task until SUCCEEDED and returns the primary entity ExtID."""
         start_time = time.time()
@@ -121,6 +164,7 @@ class NutanixPrismClient:
             time.sleep(2)
         return None
 
+    @traceable(name="Nutanix: List Clusters", run_type="tool")
     def list_clusters(self) -> List[Dict[str, Any]]:
         for v in ["v4.0", "v4.0.b1", "v4.1"]:
             try:
@@ -131,6 +175,7 @@ class NutanixPrismClient:
                 pass
         return []
 
+    @traceable(name="Nutanix: Get Cluster", run_type="tool")
     def get_cluster(self, cluster_id: str) -> Optional[Dict[str, Any]]:
         for v in ["v4.0", "v4.0.b1", "v4.1"]:
             try:
@@ -141,6 +186,7 @@ class NutanixPrismClient:
                 pass
         return None
 
+    @traceable(name="Nutanix: Get Cluster DNS Servers", run_type="tool")
     def get_cluster_dns_servers(self, preferred_cluster_id: Optional[str] = None) -> List[str]:
         """Discovers and extracts configured DNS/Name Server IPs from the target Nutanix cluster."""
         dns_servers: List[str] = []
@@ -169,6 +215,7 @@ class NutanixPrismClient:
                     break
         return dns_servers
 
+    @traceable(name="Nutanix: List Subnets", run_type="tool")
     def list_subnets(self) -> List[Dict[str, Any]]:
         for v in ["v4.0", "v4.0.b1", "v4.1"]:
             try:
@@ -179,6 +226,7 @@ class NutanixPrismClient:
                 pass
         return []
 
+    @traceable(name="Nutanix: Get Subnet", run_type="tool")
     def get_subnet(self, subnet_id: str) -> Optional[Dict[str, Any]]:
         for v in ["v4.0", "v4.0.b1", "v4.1"]:
             try:
@@ -189,6 +237,7 @@ class NutanixPrismClient:
                 pass
         return None
 
+    @traceable(name="Nutanix: Delete Subnet", run_type="tool")
     def delete_subnet(self, subnet_id: str) -> bool:
         # Detach/clean up any VPCs referencing this subnet as external subnet
         for vpc in self.list_vpcs():
@@ -216,6 +265,7 @@ class NutanixPrismClient:
                 print(f"[Error] Delete Subnet {subnet_id}: {e}")
         return False
 
+    @traceable(name="Nutanix: Create Subnet", run_type="tool")
     def create_subnet(self, subnet_payload: Dict[str, Any]) -> Optional[str]:
         for v in ["v4.0", "v4.0.b1", "v4.1"]:
             try:
@@ -236,6 +286,7 @@ class NutanixPrismClient:
                 print(f"[Error] Create Subnet exception: {e}")
         return None
 
+    @traceable(name="Nutanix: List VPCs", run_type="tool")
     def list_vpcs(self) -> List[Dict[str, Any]]:
         for v in ["v4.0", "v4.0.b1", "v4.1"]:
             try:
@@ -246,6 +297,7 @@ class NutanixPrismClient:
                 pass
         return []
 
+    @traceable(name="Nutanix: Create VPC", run_type="tool")
     def create_vpc(self, vpc_payload: Dict[str, Any]) -> Optional[str]:
         for v in ["v4.0", "v4.0.b1", "v4.1"]:
             try:
@@ -266,6 +318,7 @@ class NutanixPrismClient:
                 print(f"[Error] Create VPC exception: {e}")
         return None
 
+    @traceable(name="Nutanix: Delete VPC", run_type="tool")
     def delete_vpc(self, vpc_id: str) -> bool:
         # Clean up any subnets referencing this VPC first
         for sub in self.list_subnets():
@@ -294,6 +347,110 @@ class NutanixPrismClient:
 # ---------------------------------------------------------------------------
 # 4. LangGraph Node Implementations
 # ---------------------------------------------------------------------------
+
+def extract_subnet_ip_details(subnet: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Extracts network IP, prefix length, gateway IP, and calculates .160-.253 IPAM pool
+    from the discovered Nutanix subnet object before deletion.
+    """
+    net_ip = None
+    prefix_len = 24
+    gw_ip = None
+
+    if subnet:
+        # 1. Check ipConfig list (v4 Networking standard)
+        ip_configs = subnet.get("ipConfig", [])
+        if isinstance(ip_configs, list) and len(ip_configs) > 0:
+            cfg = ip_configs[0]
+            ipv4_cfg = cfg.get("ipv4", {}) if isinstance(cfg, dict) else {}
+
+            # Extract IP Subnet (network IP & prefix length)
+            ip_sub = ipv4_cfg.get("ipSubnet", {}) or cfg.get("ipSubnet", {})
+            if isinstance(ip_sub, dict):
+                ip_field = ip_sub.get("ip")
+                if isinstance(ip_field, dict):
+                    net_ip = ip_field.get("value")
+                elif isinstance(ip_field, str):
+                    net_ip = ip_field
+                prefix_len = ip_sub.get("prefixLength", prefix_len)
+            elif isinstance(ip_sub, str) and "/" in ip_sub:
+                parts = ip_sub.split("/")
+                net_ip = parts[0]
+                try:
+                    prefix_len = int(parts[1])
+                except Exception:
+                    pass
+
+            # Extract Gateway IP
+            gw_field = ipv4_cfg.get("defaultGatewayIp") or cfg.get("defaultGatewayIp")
+            if isinstance(gw_field, dict):
+                gw_ip = gw_field.get("value")
+            elif isinstance(gw_field, str):
+                gw_ip = gw_field
+
+        # 2. Fallbacks for direct attributes if not under ipConfig
+        if not net_ip:
+            if subnet.get("networkIp"):
+                net_ip = subnet.get("networkIp")
+            elif subnet.get("subnetIp"):
+                net_ip = subnet.get("subnetIp")
+            elif subnet.get("ipSubnet"):
+                sub_val = subnet.get("ipSubnet")
+                if isinstance(sub_val, dict):
+                    net_ip = sub_val.get("ip", {}).get("value") or sub_val.get("value")
+                    prefix_len = sub_val.get("prefixLength", prefix_len)
+                elif isinstance(sub_val, str) and "/" in sub_val:
+                    parts = sub_val.split("/")
+                    net_ip = parts[0]
+                    try:
+                        prefix_len = int(parts[1])
+                    except Exception:
+                        pass
+
+        if not gw_ip:
+            gw_val = subnet.get("gatewayIp") or subnet.get("defaultGatewayIp")
+            if isinstance(gw_val, dict):
+                gw_ip = gw_val.get("value")
+            elif isinstance(gw_val, str):
+                gw_ip = gw_val
+
+        if subnet.get("prefixLength") and prefix_len == 24:
+            try:
+                prefix_len = int(subnet.get("prefixLength"))
+            except Exception:
+                pass
+
+    # If no network IP was discovered on the subnet, fallback gracefully
+    if not net_ip:
+        net_ip = "10.55.81.0"
+    if not gw_ip:
+        octets = str(net_ip).split(".")
+        if len(octets) >= 3:
+            gw_ip = f"{octets[0]}.{octets[1]}.{octets[2]}.1"
+        else:
+            gw_ip = "10.55.81.1"
+
+    # Compute .160 to .253 IPAM range based on first 3 octets
+    base_octets = str(net_ip).split(".")
+    if len(base_octets) < 3 and gw_ip:
+        base_octets = str(gw_ip).split(".")
+
+    if len(base_octets) >= 3:
+        prefix_3 = f"{base_octets[0]}.{base_octets[1]}.{base_octets[2]}"
+    else:
+        prefix_3 = "10.55.81"
+
+    ipam_start = f"{prefix_3}.160"
+    ipam_end = f"{prefix_3}.253"
+
+    return {
+        "network_ip": net_ip,
+        "prefix_length": int(prefix_len),
+        "gateway_ip": gw_ip,
+        "ipam_start": ipam_start,
+        "ipam_end": ipam_end,
+        "ipam_pool": f"{ipam_start} - {ipam_end}"
+    }
 
 async def plan_discovery_node(state: EnablementState) -> Dict[str, Any]:
     """
@@ -395,12 +552,27 @@ async def plan_discovery_node(state: EnablementState) -> Dict[str, Any]:
     if not captured_dns_servers:
         captured_dns_servers = ["10.42.194.10"]
 
+    # 4. Extract IP & IPAM parameters from target subnet before deletion
+    ip_details = extract_subnet_ip_details(secondary_subnet)
+    captured_net_ip = ip_details["network_ip"]
+    captured_prefix_len = ip_details["prefix_length"]
+    captured_gateway_ip = ip_details["gateway_ip"]
+    ipam_start = ip_details["ipam_start"]
+    ipam_end = ip_details["ipam_end"]
+    ipam_pool_str = ip_details["ipam_pool"]
+
     captured_vlan_info = {
         "vlan_id": int(captured_vlan_id),
         "cluster_ref": captured_cluster_ref,
         "vswitch_ref": captured_vswitch_ref,
         "subnet_name": sec_name,
-        "subnet_ext_id": sec_id
+        "subnet_ext_id": sec_id,
+        "network_ip": captured_net_ip,
+        "prefix_length": captured_prefix_len,
+        "gateway_ip": captured_gateway_ip,
+        "ipam_start": ipam_start,
+        "ipam_end": ipam_end,
+        "ipam_pool": ipam_pool_str
     }
 
     discovered_state = {
@@ -413,9 +585,11 @@ async def plan_discovery_node(state: EnablementState) -> Dict[str, Any]:
     print(f"-> Discovered {len(existing_vpcs)} live VPC(s) and {len(existing_subnets)} subnet(s) on cluster.")
     print(f"-> Target Subnet Identified: '{sec_name}' (ID: {sec_id or 'Auto-Detect'})")
     print(f"-> [CAPTURE] VLAN ID captured: {captured_vlan_id} | Cluster: {captured_cluster_ref}")
+    print(f"-> [CAPTURE] Network: {captured_net_ip}/{captured_prefix_len} | Gateway: {captured_gateway_ip}")
+    print(f"-> [CAPTURE] Derived IPAM Pool (.160-.253): {ipam_pool_str}")
     print(f"-> [CAPTURE] Cluster DNS Server(s) captured: {captured_dns_servers}")
 
-    # 4. Generate Execution Plan
+    # 5. Generate Execution Plan
     execution_plan = []
     if intent == "Build":
         execution_plan = [
@@ -437,12 +611,12 @@ async def plan_discovery_node(state: EnablementState) -> Dict[str, Any]:
                 "target_type": "Subnet",
                 "target_name": sec_name,
                 "details": {
-                    "description": f"Create Network Controller External VLAN Subnet using captured VLAN ID {captured_vlan_id}",
+                    "description": f"Create Network Controller External VLAN Subnet preserving network {captured_net_ip}/{captured_prefix_len} and gateway {captured_gateway_ip}",
                     "vlan_id": captured_vlan_id,
                     "subnet_type": "VLAN (External)",
-                    "network_ip": "10.136.227.128/25",
-                    "gateway_ip": "10.136.227.129",
-                    "ipam_pool": "10.136.227.160 - 10.136.227.253",
+                    "network_ip": f"{captured_net_ip}/{captured_prefix_len}",
+                    "gateway_ip": captured_gateway_ip,
+                    "ipam_pool": ipam_pool_str,
                     "cluster_ref": captured_cluster_ref
                 }
             },
@@ -602,6 +776,10 @@ async def review_approval_node(state: EnablementState) -> Dict[str, Any]:
     if intent == "Build":
         if captured_info.get("vlan_id"):
             print(f"[CONFIRMATION] Captured VLAN ID to reuse: {captured_info.get('vlan_id')}")
+        if captured_info.get("network_ip"):
+            print(f"[CONFIRMATION] Captured Subnet Network: {captured_info.get('network_ip')}/{captured_info.get('prefix_length')}")
+            print(f"[CONFIRMATION] Captured Gateway IP    : {captured_info.get('gateway_ip')}")
+            print(f"[CONFIRMATION] Configured IPAM Pool   : {captured_info.get('ipam_pool')}")
         if captured_dns:
             print(f"[CONFIRMATION] Captured Cluster DNS Server(s) to configure: {', '.join(captured_dns)}")
 
@@ -678,6 +856,12 @@ async def execute_provisioning_node(state: EnablementState) -> Dict[str, Any]:
             })
 
         elif action == "CREATE_EXTERNAL_VLAN_SUBNET":
+            net_ip = captured_info.get("network_ip") or item.get("details", {}).get("network_ip", "10.55.81.0").split("/")[0]
+            prefix_len = int(captured_info.get("prefix_length") or 24)
+            gw_ip = captured_info.get("gateway_ip") or item.get("details", {}).get("gateway_ip", "10.55.81.1")
+            pool_start = captured_info.get("ipam_start") or f"{'.'.join(net_ip.split('.')[:3])}.160"
+            pool_end = captured_info.get("ipam_end") or f"{'.'.join(net_ip.split('.')[:3])}.253"
+
             subnet_body: Dict[str, Any] = {
                 "name": target_name,
                 "subnetType": "VLAN",
@@ -687,14 +871,14 @@ async def execute_provisioning_node(state: EnablementState) -> Dict[str, Any]:
                     {
                         "ipv4": {
                             "ipSubnet": {
-                                "ip": {"value": "10.136.227.128", "prefixLength": 32},
-                                "prefixLength": 25
+                                "ip": {"value": net_ip, "prefixLength": 32},
+                                "prefixLength": prefix_len
                             },
-                            "defaultGatewayIp": {"value": "10.136.227.129", "prefixLength": 32},
+                            "defaultGatewayIp": {"value": gw_ip, "prefixLength": 32},
                             "poolList": [
                                 {
-                                    "startIp": {"value": "10.136.227.160", "prefixLength": 32},
-                                    "endIp": {"value": "10.136.227.253", "prefixLength": 32}
+                                    "startIp": {"value": pool_start, "prefixLength": 32},
+                                    "endIp": {"value": pool_end, "prefixLength": 32}
                                 }
                             ]
                         }
@@ -712,14 +896,14 @@ async def execute_provisioning_node(state: EnablementState) -> Dict[str, Any]:
                 created_external_subnet_ext_id = captured_info.get("subnet_ext_id")
 
             if created_external_subnet_ext_id:
-                print(f"[OK] External VLAN Subnet '{target_name}' ready with VLAN {vlan_id} [ID: {created_external_subnet_ext_id}]")
+                print(f"[OK] External VLAN Subnet '{target_name}' ready with VLAN {vlan_id} ({net_ip}/{prefix_len}, GW {gw_ip}, IPAM {pool_start}-{pool_end}) [ID: {created_external_subnet_ext_id}]")
                 execution_results.append({
                     "step": step_num,
                     "action": action,
                     "target_name": target_name,
                     "extId": created_external_subnet_ext_id,
                     "status": "SUCCESS",
-                    "details": f"External VLAN Subnet with VLAN ID {vlan_id} (IPAM .160-.253)"
+                    "details": f"External VLAN Subnet with VLAN ID {vlan_id} ({net_ip}/{prefix_len}, GW {gw_ip}, IPAM {pool_start}-{pool_end})"
                 })
             else:
                 print(f"[Error] Failed to create External VLAN Subnet '{target_name}'.")
@@ -973,10 +1157,13 @@ async def review_verification_node(state: EnablementState) -> Dict[str, Any]:
 
     if intent == "Build":
         dns_display = ", ".join(captured_dns_servers) if captured_dns_servers else "None"
+        ext_net_str = f"{captured_info.get('network_ip', '10.55.81.0')}/{captured_info.get('prefix_length', 24)}"
+        ext_gw_str = captured_info.get('gateway_ip', '10.55.81.1')
+        ext_ipam_str = captured_info.get('ipam_pool', '.160-.253')
         print("\nStudent Enablement Networking Topology Provisioned:")
         print(f" * Reused VLAN ID     : {vlan_id}")
         print(f" * Cluster DNS Server : {dns_display} (Configured on all VPCs)")
-        print(f" * External Network   : Network Controller Subnet (IPAM .160-.253 on /25)")
+        print(f" * External Network   : Network Controller Subnet {ext_net_str} (GW {ext_gw_str}, IPAM {ext_ipam_str})")
         print(f" * Transit VPC        : Transit-VPC-{group_id} (DNS: {dns_display}, NAT Enabled, ERP Advertised)")
         print(f"   - Transit-ERP-{group_id}    : 10.10.10.0/24 (GW 10.10.10.1, IPAM .160-.253, ERP)")
         print(f"   - Transit-NonERP-{group_id} : 20.20.20.0/24 (GW 20.20.20.1, IPAM .160-.253, Non-ERP)")
@@ -1042,7 +1229,15 @@ async def run_workflow(initial_input: Optional[str] = None):
 
     app = build_enablement_graph()
     thread_id = f"nutanix-session-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    config = {"configurable": {"thread_id": thread_id}}
+    config = {
+        "configurable": {"thread_id": thread_id},
+        "run_name": "Nutanix HPOC Network Enablement",
+        "tags": ["nutanix", "transit-vpc", "automation"],
+        "metadata": {
+            "thread_id": thread_id,
+            "pc_host": os.getenv("PC_HOST", "127.0.0.1")
+        }
+    }
 
     initial_state = {
         "messages": [SystemMessage(content="Starting Nutanix Enablement Networking workflow.")]
